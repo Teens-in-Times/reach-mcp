@@ -1,0 +1,18 @@
+{
+  "listen": "127.0.0.1:42373",
+  "auth_file": "D:\\Reach\\private\\credentials.json",
+  "default_cwd": "G:\\Project",
+  "state_dir": "D:\\Reach\\private\\state",
+  "ssh": {
+    "host": "your-ssh-config-alias",
+    "hostname": "YOUR_SERVER_IP",
+    "host_key_alias": "YOUR_KNOWN_HOST_ENTRY",
+    "remote_port": 17898
+  },
+  "requests_per_minute": 240,
+  "admin": {
+    "listen": "127.0.0.1:42374",
+    "tickets_file": "D:\\Reach\\private\\login-tickets.json"
+  },
+  "protected_paths": ["D:\\Reach\\private"]
+}
