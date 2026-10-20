@@ -1,5 +1,7 @@
 # Reach
 
+项目仓库：[Teens-in-Times/reach-mcp](https://github.com/Teens-in-Times/reach-mcp)。
+
 让通用 agent 操作本机的独立 Rust MCP 服务。文件、补丁、命令、进程输入与图片直接执行，不经过第二个 agent，也不依赖 Python、Node.js 或其他执行器。
 
 一个二进制，两个可选工具呈现方式，一段文本钥匙，一个本机管理页。管理页和 MCP 的权限分开；工具调用是否经过人工批准，由使用它的 MCP 客户端决定。Reach 收到通过鉴权、权限与参数检查的调用后直接执行。
