@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -152,70 +151,113 @@ pub fn read_with_policy(
     Ok(json!({"files":results}))
 }
 
-fn verify_expected(args: &Value, bytes: &[u8]) -> Result<()> {
-    if let Some(expected) = args.get("expected_sha256") {
-        ensure!(
-            expected.as_str() == Some(hash(bytes).as_str()),
-            "File changed since it was read; read again before editing"
-        );
+pub fn write(
+    cwd: &Path,
+    args: &crate::operation::WriteArgs,
+) -> crate::error::Result<crate::changes::Receipt> {
+    use crate::{
+        changes::{self, Change},
+        error::Failure,
+        operation::WriteMode,
+    };
+    let path = resolve(cwd, &args.path);
+    if args.content.len() > changes::MAX_FILE {
+        return Err(Failure::invalid("Content exceeds 16 MiB"));
     }
-    Ok(())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("File needs a parent directory")?;
-    fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    if let Ok(metadata) = fs::metadata(path) {
-        temp.as_file().set_permissions(metadata.permissions())?;
-    }
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
-
-pub fn mutate(tool: &str, cwd: &Path, args: &Value) -> Result<Value> {
-    let path = resolve(cwd, text_arg(args, "path")?);
-    let content = if tool == "Write" {
-        let content = text_arg(args, "content")?;
-        ensure!(content.len() as u64 <= MAX_FILE, "Content exceeds 16 MiB");
-        let old = if path.exists() {
-            read_bytes(&path)?
-        } else {
-            Vec::new()
-        };
-        verify_expected(args, &old)?;
-        if flag(args, "append")? {
-            let mut combined = old;
-            combined.extend_from_slice(content.as_bytes());
-            combined
-        } else {
-            content.as_bytes().to_vec()
+    changes::text(args.content.as_bytes())?;
+    let before = changes::bytes(&path)?;
+    let after = match args.mode {
+        WriteMode::Create => {
+            if args.expected_sha256.is_some() {
+                return Err(Failure::invalid("create does not accept expected_sha256"));
+            }
+            if before.is_some() {
+                return Err(Failure::conflict("create refuses an existing file"));
+            }
+            args.content.as_bytes().to_vec()
         }
-    } else {
-        let old = read_bytes(&path)?;
-        verify_expected(args, &old)?;
-        let text = std::str::from_utf8(&old).context("Not a UTF-8 text file")?;
-        let from = text_arg(args, "old_string")?;
-        ensure!(!from.is_empty(), "old_string must not be empty");
-        let to = text_arg(args, "new_string")?;
-        let matches = text.matches(from).count();
-        ensure!(matches > 0, "old_string was not found; read the file again");
-        let all = flag(args, "replace_all")?;
-        ensure!(
-            all || matches == 1,
-            "old_string matches {matches} times; include more context or use replace_all"
-        );
-        if all {
-            text.replace(from, to).into_bytes()
-        } else {
-            text.replacen(from, to, 1).into_bytes()
+        WriteMode::Replace | WriteMode::Append => {
+            let old = before
+                .as_ref()
+                .ok_or_else(|| Failure::conflict("replace/append requires an existing file"))?;
+            changes::text(old)?;
+            changes::verify(
+                args.expected_sha256.as_deref().ok_or_else(|| {
+                    Failure::invalid("replace/append requires expected_sha256 from Read")
+                })?,
+                old,
+            )?;
+            if matches!(args.mode, WriteMode::Append) {
+                let mut b = old.clone();
+                b.extend_from_slice(args.content.as_bytes());
+                b
+            } else {
+                args.content.as_bytes().to_vec()
+            }
         }
     };
-    ensure!(content.len() as u64 <= MAX_FILE, "Result exceeds 16 MiB");
-    atomic_write(&path, &content)?;
-    Ok(json!({"path":path,"bytes":content.len(),"sha256":hash(&content)}))
+    if after.len() > changes::MAX_FILE {
+        return Err(Failure::invalid("Result exceeds 16 MiB"));
+    }
+    changes::execute(
+        &[Change {
+            path,
+            before,
+            after: Some(after),
+        }],
+        false,
+    )
+}
+pub fn edit(
+    cwd: &Path,
+    args: &crate::operation::EditArgs,
+) -> crate::error::Result<crate::changes::Receipt> {
+    use crate::{
+        changes::{self, Change},
+        error::{Code, Failure},
+    };
+    let path = resolve(cwd, &args.path);
+    let before = changes::bytes(&path)?.ok_or_else(|| {
+        Failure::new(
+            Code::NotFound,
+            "Edit target not found",
+            "Read the target first.",
+        )
+    })?;
+    changes::verify(&args.expected_sha256, &before)?;
+    let text = changes::text(&before)?;
+    if args.old_string.is_empty() {
+        return Err(Failure::invalid("old_string must not be empty"));
+    }
+    let matches = text.matches(&args.old_string).count();
+    if matches == 0 {
+        return Err(Failure::conflict("old_string was not found"));
+    }
+    if matches > 1 && !args.replace_all {
+        return Err(Failure::new(
+            Code::AmbiguousMatch,
+            format!("old_string occurs {matches} times"),
+            "Include unique context, or explicitly choose replace_all.",
+        ));
+    }
+    let after = if args.replace_all {
+        text.replace(&args.old_string, &args.new_string)
+    } else {
+        text.replacen(&args.old_string, &args.new_string, 1)
+    }
+    .into_bytes();
+    changes::text(&after)?;
+    if after.len() > changes::MAX_FILE {
+        return Err(Failure::invalid("Result exceeds 16 MiB"));
+    }
+    changes::execute(
+        &[Change {
+            path,
+            before: Some(before),
+            after: Some(after),
+        }],
+        false,
+    )
 }
 
 pub fn search(tool: &str, cwd: &Path, args: &Value) -> Result<Value> {
@@ -389,41 +431,6 @@ pub fn search_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn stale_edits_and_nonunique_replacements_do_not_change_files() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "same same\r\n").unwrap();
-        assert!(
-            mutate(
-                "Edit",
-                dir.path(),
-                &json!({"path":"a.txt","old_string":"same","new_string":"new"})
-            )
-            .is_err()
-        );
-        assert!(
-            mutate(
-                "Write",
-                dir.path(),
-                &json!({"path":"a.txt","content":"bad","expected_sha256":"stale"})
-            )
-            .is_err()
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "same same\r\n"
-        );
-        mutate(
-            "Edit",
-            dir.path(),
-            &json!({"path":"a.txt","old_string":"same","new_string":"new","replace_all":true}),
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "new new\r\n"
-        );
-    }
     #[test]
     fn batch_read_continuation_and_ignored_search() {
         let dir = tempfile::tempdir().unwrap();

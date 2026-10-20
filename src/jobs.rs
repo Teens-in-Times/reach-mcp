@@ -12,6 +12,25 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Interrupted,
+    Unknown,
+    Expired,
+}
+impl State {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Queued | Self::Running)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default = "legacy_owner")]
@@ -19,7 +38,7 @@ pub struct Record {
     pub task_id: Uuid,
     pub tool: String,
     pub cwd: PathBuf,
-    pub status: String,
+    pub status: State,
     pub submitted_ms: u64,
     pub finished_ms: Option<u64>,
     pub fingerprint: String,
@@ -30,6 +49,7 @@ pub struct Task {
     pub record: Mutex<Record>,
     pub cancel: CancellationToken,
     pub stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    pub changed: tokio::sync::Notify,
 }
 
 fn legacy_owner() -> String {
@@ -49,8 +69,8 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-pub fn terminal(status: &str) -> bool {
-    status != "running"
+pub fn terminal(status: &State) -> bool {
+    status.is_terminal()
 }
 
 impl Jobs {
@@ -66,7 +86,7 @@ impl Jobs {
             let mut record: Record = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("Cannot recover task metadata {}", path.display()))?;
             if !terminal(&record.status) {
-                record.status = "interrupted".into();
+                record.status = State::Interrupted;
                 record.finished_ms = Some(now());
                 record.result = Some(
                     json!({"error":"Executor restarted before the outcome was recorded. Inspect the files/logs; do not blindly repeat this operation."}),
@@ -79,15 +99,18 @@ impl Jobs {
                     record: Mutex::new(record),
                     cancel: CancellationToken::new(),
                     stdin: tokio::sync::Mutex::new(None),
+                    changed: tokio::sync::Notify::new(),
                 }),
             );
         }
-        Ok(Self {
+        let jobs = Self {
             root,
             tasks: Mutex::new(tasks),
             mutation_gate: tokio::sync::Mutex::new(()),
             slots: Arc::new(tokio::sync::Semaphore::new(4)),
-        })
+        };
+        jobs.cleanup()?;
+        Ok(jobs)
     }
 
     fn persist_at(root: &Path, record: &Record) -> Result<()> {
@@ -118,6 +141,7 @@ impl Jobs {
         args: &Value,
         id: Option<Uuid>,
     ) -> Result<(Arc<Task>, bool)> {
+        self.cleanup()?;
         let fingerprint = crate::files::hash(
             serde_json::to_string(&json!({"owner":owner,"tool":tool,"cwd":cwd,"args":args}))?
                 .as_bytes(),
@@ -131,24 +155,53 @@ impl Jobs {
             );
             ensure!(
                 task.record.lock().expect("task").fingerprint == fingerprint,
-                "operation_id already belongs to different arguments; no operation was executed"
+                crate::error::Failure::conflict(
+                    "operation_id belongs to different arguments; no operation was executed"
+                )
             );
             return Ok((task.clone(), false));
         }
+        ensure!(
+            tasks.len() < 10000,
+            crate::error::Failure::new(
+                crate::error::Code::CapacityExceeded,
+                "Durable idempotency ledger reached 10000 tasks",
+                "Archive this executor state and start a new state namespace; old IDs must not be retried in the new namespace."
+            )
+        );
         ensure!(
             tasks
                 .values()
                 .filter(|t| !terminal(&t.record.lock().expect("task").status))
                 .count()
                 < 32,
-            "Too many active/queued tasks; query Tasks first"
+            crate::error::Failure::new(
+                crate::error::Code::CapacityExceeded,
+                "Too many active/queued tasks",
+                "Wait for or cancel existing work, then submit a new operation."
+            )
+        );
+        ensure!(
+            tasks
+                .values()
+                .filter(|t| {
+                    let r = t.record.lock().expect("task");
+                    r.owner == owner && !r.status.is_terminal()
+                })
+                .count()
+                < 8,
+            crate::error::Failure::new(
+                crate::error::Code::CapacityExceeded,
+                "Principal already has 8 pending tasks",
+                "Wait for or cancel owned tasks."
+            )
         );
         let record = Record {
             owner: owner.into(),
             task_id: id,
             tool: tool.into(),
             cwd: cwd.to_path_buf(),
-            status: "running".into(),
+            status: State::Queued,
             submitted_ms: now(),
             finished_ms: None,
             fingerprint,
@@ -159,22 +212,40 @@ impl Jobs {
             record: Mutex::new(record),
             cancel: CancellationToken::new(),
             stdin: tokio::sync::Mutex::new(None),
+            changed: tokio::sync::Notify::new(),
         });
         tasks.insert(id, task.clone());
         Ok((task, true))
     }
 
-    pub fn finish(&self, task: &Task, status: &str, result: Value) {
+    pub fn running(&self, task: &Task) -> Result<bool> {
         let mut record = task.record.lock().expect("task");
-        record.status = status.into();
+        ensure!(record.status == State::Queued, "Task is not queued");
+        if task.cancel.is_cancelled() {
+            return Ok(false);
+        }
+        record.status = State::Running;
+        Self::persist_at(&self.root, &record)?;
+        task.changed.notify_waiters();
+        Ok(true)
+    }
+
+    pub fn finish(&self, task: &Task, status: State, result: Value) {
+        let mut record = task.record.lock().expect("task");
+        if record.status.is_terminal() {
+            return;
+        }
+        assert!(status.is_terminal(), "finish requires a terminal state");
+        record.status = status;
         record.finished_ms = Some(now());
         record.result = Some(result);
         if let Err(error) = Self::persist_at(&self.root, &record) {
-            record.status = "unknown".into();
+            record.status = State::Unknown;
             record.result = Some(
                 json!({"error":"The operation finished but its durable result could not be saved. Inspect before retrying.","storage_error":error.to_string()}),
             );
         }
+        task.changed.notify_waiters();
     }
 
     pub fn get(&self, id: Uuid) -> Result<Arc<Task>> {
@@ -183,14 +254,25 @@ impl Jobs {
             .expect("task registry")
             .get(&id)
             .cloned()
-            .context("Task not found; use Tasks list")
+            .ok_or_else(|| {
+                crate::error::Failure::new(
+                    crate::error::Code::NotFound,
+                    "Task not found",
+                    "Use Tasks to recover an owned task; do not blindly repeat a lost submission.",
+                )
+                .into()
+            })
     }
 
     pub fn get_owned(&self, owner: &str, id: Uuid) -> Result<Arc<Task>> {
         let task = self.get(id)?;
         ensure!(
             task.record.lock().expect("task").owner == owner,
-            "Task not found"
+            crate::error::Failure::new(
+                crate::error::Code::NotFound,
+                "Task not found",
+                "Use Tasks to list owned work."
+            )
         );
         Ok(task)
     }
@@ -198,12 +280,15 @@ impl Jobs {
     pub async fn report(&self, task: &Task, wait_seconds: u64) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
         loop {
+            let notified = task.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let record = task.record.lock().expect("task").clone();
             if terminal(&record.status) || tokio::time::Instant::now() >= deadline {
                 return json!({"task_id":record.task_id,"tool":record.tool,"cwd":record.cwd,"status":record.status,
                     "submitted_ms":record.submitted_ms,"finished_ms":record.finished_ms,"result":record.result});
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = tokio::time::timeout_at(deadline, notified).await;
         }
     }
 
@@ -294,7 +379,7 @@ impl Jobs {
 
     pub fn cancel(&self, task: &Task) -> Result<()> {
         let record = task.record.lock().expect("task");
-        if !terminal(&record.status) && record.tool != "Shell" {
+        if record.status == State::Running && record.tool != "Shell" {
             bail!("Only Shell tasks can be cancelled; file writes finish atomically");
         }
         task.cancel.cancel();
@@ -314,6 +399,32 @@ impl Jobs {
             .values()
             .filter(|t| !terminal(&t.record.lock().expect("task").status))
             .count()
+    }
+
+    /// Keep retry identities even after result/log expiration: expired work is never replayed.
+    pub fn cleanup(&self) -> Result<()> {
+        let tasks = self.tasks.lock().expect("task registry");
+        for task in tasks.values() {
+            let mut record = task.record.lock().expect("task");
+            if record.status != State::Expired
+                && record.status.is_terminal()
+                && record
+                    .finished_ms
+                    .is_some_and(|end| now().saturating_sub(end) > 7 * 24 * 3600 * 1000)
+            {
+                for path in [self.logs(record.task_id).0, self.logs(record.task_id).1] {
+                    if let Err(e) = fs::remove_file(path)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(e.into());
+                    }
+                }
+                record.status = State::Expired;
+                record.result = None;
+                Self::persist_at(&self.root, &record)?;
+            }
+        }
+        Ok(())
     }
     pub fn summaries(&self, limit: usize) -> Value {
         let mut rows: Vec<_> = self
@@ -351,7 +462,7 @@ mod tests {
         );
         let (two, _) = jobs.start("Write", dir.path(), &args, None).unwrap();
         assert_ne!(id, two.record.lock().unwrap().task_id);
-        jobs.finish(&one, "completed", json!({"ok":true}));
+        jobs.finish(&one, State::Completed, json!({"ok":true}));
         drop(jobs);
         let recovered = Jobs::open(dir.path()).unwrap();
         assert_eq!(

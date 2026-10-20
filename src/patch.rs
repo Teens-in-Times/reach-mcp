@@ -2,19 +2,13 @@
 //! All edits are validated before writes. Each replacement is atomic; a multi-file
 //! patch is not a crash-atomic filesystem transaction.
 use anyhow::{Context, Result, bail, ensure};
-use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     fs,
-    io::Write,
     path::{Component, Path, PathBuf},
 };
 
-struct Change {
-    path: PathBuf,
-    before: Option<Vec<u8>>,
-    after: Option<Vec<u8>>,
-}
+use crate::changes::{Change, bytes};
 
 fn target(cwd: &Path, name: &str) -> Result<PathBuf> {
     let relative = Path::new(name);
@@ -38,45 +32,22 @@ fn target(cwd: &Path, name: &str) -> Result<PathBuf> {
     ensure!(!path.is_dir(), "Patch target is a directory");
     Ok(path)
 }
-fn bytes(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(b) => {
-            ensure!(b.len() <= 16 * 1024 * 1024, "Patch file exceeds 16 MiB");
-            Ok(Some(b))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-fn atomic(path: &Path, content: &[u8]) -> Result<()> {
-    let parent = path.parent().context("Missing parent")?;
-    fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(content)?;
-    if let Ok(m) = fs::metadata(path) {
-        temp.as_file().set_permissions(m.permissions())?;
-    }
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
-
-pub fn apply(cwd: &Path, args: &Value) -> Result<Value> {
+pub fn apply(cwd: &Path, args: &crate::operation::PatchArgs) -> Result<crate::changes::Receipt> {
     apply_with_policy(cwd, args, None)
 }
 pub fn apply_with_policy(
     cwd: &Path,
-    args: &Value,
+    args: &crate::operation::PatchArgs,
     policy: Option<&crate::policy::Policy>,
-) -> Result<Value> {
-    let patch = crate::files::text_arg(args, "patch")?;
+) -> Result<crate::changes::Receipt> {
+    let patch = &args.patch;
     ensure!(patch.len() <= 1024 * 1024, "Patch exceeds 1 MiB");
     let lines: Vec<&str> = patch.lines().collect();
     ensure!(
         lines.first() == Some(&"*** Begin Patch") && lines.last() == Some(&"*** End Patch"),
         "Expected *** Begin Patch and *** End Patch"
     );
-    let hashes = args.get("expected_sha256").and_then(Value::as_object);
+    let hashes = &args.expected_sha256;
     let mut changes: Vec<Change> = Vec::new();
     let mut seen = HashSet::new();
     let mut i = 1;
@@ -99,12 +70,15 @@ pub fn apply_with_policy(
         }
         ensure!(seen.insert(path_key(&path)), "Duplicate patch target");
         let before = bytes(&path)?;
-        if let Some(expected) = hashes.and_then(|h| h.get(name)) {
-            ensure!(
-                expected.as_str()
-                    == Some(crate::files::hash(before.as_deref().unwrap_or_default()).as_str()),
-                "Stale file: {name}"
-            );
+        if let Some(before) = &before {
+            crate::changes::verify(
+                hashes
+                    .get(name)
+                    .context("Existing patch source requires expected_sha256 from Read")?,
+                before,
+            )?;
+        } else if hashes.contains_key(name) {
+            bail!("New file must not have an expected_sha256");
         }
         match kind {
             "add" => {
@@ -236,36 +210,7 @@ pub fn apply_with_policy(
     ensure!(!changes.is_empty(), "Empty patch");
     // Write destinations before deleting move sources, reducing damage from interruption.
     changes.sort_by_key(|change| change.after.is_none());
-    for change in &changes {
-        ensure!(
-            bytes(&change.path)? == change.before,
-            "File changed while validating patch"
-        );
-    }
-    for (committed, change) in changes.iter().enumerate() {
-        let result = if let Some(after) = &change.after {
-            atomic(&change.path, after)
-        } else {
-            fs::remove_file(&change.path).map_err(Into::into)
-        };
-        if let Err(error) = result {
-            let mut rollback_errors = Vec::new();
-            for old in changes[..committed].iter().rev() {
-                let result = if let Some(before) = &old.before {
-                    atomic(&old.path, before)
-                } else {
-                    fs::remove_file(&old.path).map_err(Into::into)
-                };
-                if let Err(e) = result {
-                    rollback_errors.push(e.to_string());
-                }
-            }
-            bail!("Patch commit failed: {error}; rollback errors: {rollback_errors:?}");
-        }
-    }
-    Ok(
-        json!({"files":changes.iter().map(|c|json!({"path":c.path.strip_prefix(cwd).unwrap_or(&c.path),"action":if c.after.is_none(){"deleted"}else if c.before.is_none(){"created"}else{"updated"},"sha256":c.after.as_deref().map(crate::files::hash)})).collect::<Vec<_>>(),"validation_atomic":true,"crash_atomic":false}),
-    )
+    Ok(crate::changes::execute(&changes, args.preview)?)
 }
 
 fn path_key(path: &Path) -> String {
@@ -280,6 +225,24 @@ fn path_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    fn apply(cwd: &Path, v: &Value) -> Result<crate::changes::Receipt> {
+        let mut v = v.clone();
+        if v.get("expected_sha256").is_none() {
+            let hashes = fs::read_dir(cwd)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        json!(crate::files::hash(&fs::read(e.path()).unwrap())),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            v["expected_sha256"] = Value::Object(hashes);
+        }
+        super::apply(cwd, &serde_json::from_value(v)?)
+    }
     #[test]
     fn validates_every_file_before_writing_and_preserves_crlf() {
         let d = tempfile::tempdir().unwrap();

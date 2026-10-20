@@ -21,6 +21,7 @@ fn setup() -> (tempfile::TempDir, engine::Hand) {
             config: Arc::new(config.clone()),
             audit: Arc::new(crate::audit::Audit::open(&config.state_dir).unwrap()),
             jobs,
+            terminals: crate::terminal::Terminals::open(&config.state_dir).unwrap(),
         },
     )
 }
@@ -28,7 +29,7 @@ fn setup() -> (tempfile::TempDir, engine::Hand) {
 #[tokio::test]
 async fn file_calls_generate_ids_and_retries_survive_recovery() {
     let (_root, hand) = setup();
-    let args = json!({"path":"sample.txt","content":"alpha\n"});
+    let args = json!({"path":"sample.txt","content":"alpha\n","mode":"create"});
     let first = hand.execute("Write", args.clone()).await.unwrap();
     assert_eq!(first["status"], "completed");
     let mut retry = args;
@@ -140,8 +141,8 @@ async fn cancellation_owns_and_terminates_descendants() {
 #[test]
 fn catalog_is_small_and_ids_are_not_required_for_mutations() {
     let tools = catalog::tools();
-    assert_eq!(tools.len(), 13);
-    assert!(serde_json::to_vec(&tools).unwrap().len() < 13000);
+    assert_eq!(tools.len(), 19);
+    assert!(serde_json::to_vec(&tools).unwrap().len() < 35000);
     for tool in tools {
         if matches!(tool.name.as_ref(), "Write" | "Edit" | "Shell") {
             assert!(

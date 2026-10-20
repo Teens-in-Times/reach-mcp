@@ -346,10 +346,12 @@ async fn main() -> Result<()> {
     let stop = CancellationToken::new();
     let jobs = Arc::new(Jobs::open(&config.state_dir)?);
     let audit = Arc::new(Audit::open(&config.state_dir)?);
+    let terminals = reach_mcp::terminal::Terminals::open(&config.state_dir)?;
     let hand = Hand {
         config: Arc::new(config.clone()),
         jobs: jobs.clone(),
         audit,
+        terminals: terminals.clone(),
     };
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let admin_server = if let Some(admin) = config.admin.clone() {
@@ -380,6 +382,7 @@ async fn main() -> Result<()> {
         .await;
     stop.cancel();
     jobs.cancel_all();
+    tokio::task::spawn_blocking(move || terminals.shutdown()).await?;
     for _ in 0..100 {
         if jobs.active_count() == 0 {
             break;

@@ -61,6 +61,7 @@ fn fixture() -> Fixture {
         config: Arc::new(config.clone()),
         jobs: Arc::new(Jobs::open(&config.state_dir).unwrap()),
         audit: Arc::new(Audit::open(&config.state_dir).unwrap()),
+        terminals: crate::terminal::Terminals::open(&config.state_dir).unwrap(),
     };
     let app = crate::admin::router(hand.clone(), admin.clone());
     Fixture {

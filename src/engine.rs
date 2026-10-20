@@ -1,226 +1,352 @@
-use crate::{Config, auth::Principal, catalog, files, jobs::Jobs, patch, process};
-use anyhow::{Context, Result, bail, ensure};
+use crate::{
+    Config,
+    auth::Principal,
+    error::{Code, Failure, Result},
+    files,
+    jobs::{Jobs, State},
+    operation::*,
+    policy::Policy,
+};
+use serde::Serialize;
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use uuid::Uuid;
+
 #[derive(Clone)]
 pub struct Hand {
     pub config: Arc<Config>,
     pub jobs: Arc<Jobs>,
     pub audit: Arc<crate::audit::Audit>,
-}
-fn seconds(args: &Value, key: &str, default: u64, max: u64, min: u64) -> Result<u64> {
-    let value = match args.get(key) {
-        None => default,
-        Some(v) => v
-            .as_u64()
-            .with_context(|| format!("{key} must be an integer"))?,
-    };
-    ensure!(
-        value >= min && value <= max,
-        "{key} must be between {min} and {max}"
-    );
-    Ok(value)
+    pub terminals: Arc<crate::terminal::Terminals>,
 }
 
+#[derive(Serialize)]
+enum Work {
+    Write(WriteArgs),
+    Edit(EditArgs),
+    Patch(PatchArgs),
+    Shell(ShellArgs),
+}
+impl Work {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Write(_) => "Write",
+            Self::Edit(_) => "Edit",
+            Self::Patch(_) => "ApplyPatch",
+            Self::Shell(_) => "Shell",
+        }
+    }
+}
+// Temporary adapter for the bounded read/search/image implementation. All dispatch is typed.
+fn arguments(args: impl Serialize) -> Value {
+    let mut v = serde_json::to_value(args).expect("serializable arguments");
+    if let Some(m) = v.as_object_mut() {
+        m.retain(|_, v| !v.is_null());
+    }
+    v
+}
 impl Hand {
-    fn cwd(&self, args: &Value, principal: &Principal) -> Result<PathBuf> {
-        let cwd = match args.get("cwd") {
-            Some(v) => PathBuf::from(v.as_str().context("cwd must be a string")?),
-            None => principal
-                .roots
-                .first()
-                .unwrap_or(&self.config.default_cwd)
-                .clone(),
-        };
-        ensure!(
-            cwd.is_absolute() && cwd.is_dir(),
-            "cwd must be an existing absolute local directory"
-        );
+    fn cwd(&self, requested: Option<&Path>, p: &Principal) -> Result<PathBuf> {
+        let cwd = requested.unwrap_or_else(|| p.roots.first().unwrap_or(&self.config.default_cwd));
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err(Failure::invalid(
+                "cwd must be an existing absolute directory",
+            ));
+        }
         Ok(std::fs::canonicalize(cwd)?)
     }
-
     #[cfg(test)]
     pub async fn execute(&self, name: &str, args: Value) -> Result<Value> {
         self.execute_for(&Principal::full("test"), name, args).await
     }
-    pub async fn execute_for(
-        &self,
-        principal: &Principal,
-        name: &str,
-        mut args: Value,
-    ) -> Result<Value> {
-        ensure!(
-            principal.allows(name),
-            "Permission denied for this operation"
-        );
-        catalog::validate(name, &args)?;
-        let policy = crate::policy::Policy::new(&self.config, principal)?;
-        if name == "Info" {
-            return Ok(
-                json!({"server":"reach","version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"default_cwd":principal.roots.first().unwrap_or(&self.config.default_cwd),"principal":principal.id,"scopes":principal.scopes,"profile":principal.profile,"stateless_http":true,"pty":false}),
-            );
+    pub async fn execute_for(&self, p: &Principal, name: &str, args: Value) -> Result<Value> {
+        if !p.allows(name) {
+            return Err(Failure::new(
+                Code::PermissionDenied,
+                "Operation is not permitted",
+                "Use Discover for permitted operations.",
+            ));
         }
-        if name == "Image" {
-            let cwd = self.cwd(&args, principal)?;
-            policy.check(&files::resolve(&cwd, files::text_arg(&args, "path")?))?;
-            return crate::image::load(&cwd, &args);
+        self.execute_operation(p, Operation::decode(name, args)?)
+            .await
+    }
+    pub async fn execute_operation(&self, p: &Principal, operation: Operation) -> Result<Value> {
+        if !p.allows(operation.name()) {
+            return Err(Failure::new(
+                Code::PermissionDenied,
+                "Operation is not permitted",
+                "Use Discover for permitted operations.",
+            ));
         }
-        if matches!(name, "Input" | "Poll") {
-            let task = self.jobs.get_owned(
-                &principal.id,
-                Uuid::parse_str(files::text_arg(&args, "task_id")?)?,
-            )?;
-            if name == "Input" {
-                let text = files::text_arg(&args, "text")?;
-                let eof = files::flag(&args, "eof")?;
-                self.jobs.input(&task, text, eof).await?;
-                return Ok(
-                    json!({"task_id":task.record.lock().expect("task").task_id,"accepted_bytes":text.len(),"stdin_closed":eof}),
-                );
+        let policy = Policy::new(&self.config, p).map_err(Failure::from)?;
+        match operation {
+            Operation::Info(_) => Ok(
+                json!({"server":"reach","version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"default_cwd":p.roots.first().unwrap_or(&self.config.default_cwd),"principal":p.id,"scopes":p.scopes,"profile":p.profile,"stateless_http":true,"pty":true}),
+            ),
+            Operation::TerminalOpen(mut a) => {
+                let cwd = self.cwd(a.cwd.take().as_deref(), p)?;
+                let terminals = self.terminals.clone();
+                let owner = p.id.clone();
+                tokio::task::spawn_blocking(move || terminals.create(&owner, &cwd, a))
+                    .await
+                    .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                    .map(|r| json!(r))
             }
-            let offset = |key: &str| -> Result<u64> {
-                match args.get(key) {
-                    None => Ok(0),
-                    Some(v) => v
-                        .as_u64()
-                        .context("Offset must be a nonnegative byte offset"),
+            Operation::TerminalRead(a) => self.terminals.read(&p.id, a).await.map(|r| json!(r)),
+            Operation::TerminalInput(a) => self.terminals.input(&p.id, a).await.map(|r| json!(r)),
+            Operation::TerminalResize(a) => {
+                let terminals = self.terminals.clone();
+                let owner = p.id.clone();
+                tokio::task::spawn_blocking(move || terminals.resize(&owner, a))
+                    .await
+                    .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                    .map(|r| json!(r))
+            }
+            Operation::TerminalClose(a) => {
+                let terminals = self.terminals.clone();
+                let owner = p.id.clone();
+                tokio::task::spawn_blocking(move || terminals.close(&owner, a.terminal_id))
+                    .await
+                    .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                    .map(|r| json!(r))
+            }
+            Operation::Terminals(_) => Ok(json!({"terminals":self.terminals.list(&p.id)})),
+            Operation::Read(a) => {
+                if a.paths.is_empty() || a.paths.len() > 20 {
+                    return Err(Failure::invalid("Read accepts 1..20 paths"));
                 }
-            };
-            return self
-                .jobs
-                .poll(
-                    &task,
-                    seconds(&args, "wait_seconds", 0, 30, 0)?,
-                    offset("stdout_offset")?,
-                    offset("stderr_offset")?,
-                    files::count(&args, "limit", 12000, 12000)?,
-                )
-                .await;
-        }
-
-        if name == "Cancel" {
-            let id = Uuid::parse_str(files::text_arg(&args, "task_id")?)?;
-            let task = self.jobs.get_owned(&principal.id, id)?;
-            self.jobs.cancel(&task)?;
-            return Ok(self.jobs.report(&task, 10).await);
-        }
-        if name == "Tasks" {
-            let action = args.get("action").and_then(Value::as_str).unwrap_or(
-                if args.get("task_id").is_some() {
-                    "get"
-                } else {
-                    "list"
-                },
-            );
-            return match action {
-                "list" => Ok(self.jobs.list(
-                    &principal.id,
-                    &self.cwd(&args, principal)?,
-                    files::count(&args, "limit", 5, 50)?,
-                )),
-                "get" => {
-                    let task = self.jobs.get_owned(
-                        &principal.id,
-                        Uuid::parse_str(files::text_arg(&args, "task_id")?)?,
-                    )?;
-                    if args.get("cwd").is_some() {
-                        ensure!(
-                            task.record.lock().expect("task").cwd == self.cwd(&args, principal)?,
-                            "Task belongs to another cwd"
-                        );
+                let cwd = self.cwd(a.cwd.as_deref(), p)?;
+                tokio::task::spawn_blocking(move || {
+                    files::read_with_policy(&cwd, &arguments(a), Some(&policy))
+                })
+                .await
+                .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                .map_err(Failure::from)
+            }
+            Operation::Glob(a) => {
+                let cwd = self.cwd(a.cwd.as_deref(), p)?;
+                tokio::task::spawn_blocking(move || {
+                    files::search_with_policy("Glob", &cwd, &arguments(a), Some(&policy))
+                })
+                .await
+                .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                .map_err(Failure::from)
+            }
+            Operation::Grep(a) => {
+                let cwd = self.cwd(a.cwd.as_deref(), p)?;
+                tokio::task::spawn_blocking(move || {
+                    files::search_with_policy("Grep", &cwd, &arguments(a), Some(&policy))
+                })
+                .await
+                .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                .map_err(Failure::from)
+            }
+            Operation::Image(a) => {
+                let cwd = self.cwd(a.cwd.as_deref(), p)?;
+                check(&policy, &files::resolve(&cwd, &a.path))?;
+                tokio::task::spawn_blocking(move || crate::image::load(&cwd, &arguments(a)))
+                    .await
+                    .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                    .map_err(Failure::from)
+            }
+            Operation::Write(mut a) => {
+                match a.mode {
+                    WriteMode::Create if a.expected_sha256.is_some() => {
+                        return Err(Failure::invalid("create does not accept expected_sha256"));
                     }
+                    WriteMode::Replace | WriteMode::Append if a.expected_sha256.is_none() => {
+                        return Err(Failure::invalid("replace/append requires expected_sha256"));
+                    }
+                    _ => {}
+                }
+                let cwd = self.cwd(a.cwd.take().as_deref(), p)?;
+                check(&policy, &files::resolve(&cwd, &a.path))?;
+                let id = a.operation_id.take();
+                self.submit(p, Work::Write(a), cwd, policy, id, 10).await
+            }
+            Operation::Edit(mut a) => {
+                if a.old_string.is_empty() {
+                    return Err(Failure::invalid("old_string must not be empty"));
+                }
+                let cwd = self.cwd(a.cwd.take().as_deref(), p)?;
+                check(&policy, &files::resolve(&cwd, &a.path))?;
+                let id = a.operation_id.take();
+                self.submit(p, Work::Edit(a), cwd, policy, id, 10).await
+            }
+            Operation::ApplyPatch(mut a) => {
+                let cwd = self.cwd(a.cwd.take().as_deref(), p)?;
+                if a.preview {
+                    return tokio::task::spawn_blocking(move || {
+                        crate::patch::apply_with_policy(&cwd, &a, Some(&policy))
+                    })
+                    .await
+                    .map_err(|e| Failure::from(anyhow::Error::from(e)))?
+                    .map(|r| json!(r))
+                    .map_err(Failure::from);
+                }
+                let id = a.operation_id.take();
+                self.submit(p, Work::Patch(a), cwd, policy, id, 10).await
+            }
+            Operation::Shell(mut a) => {
+                if a.command.trim().is_empty() {
+                    return Err(Failure::invalid("command must not be empty"));
+                }
+                let cwd = self.cwd(a.cwd.take().as_deref(), p)?;
+                let id = a.operation_id.take();
+                let wait = a.wait_seconds.take().map(|n| n.get()).unwrap_or(10);
+                self.submit(p, Work::Shell(a), cwd, policy, id, wait).await
+            }
+            Operation::Tasks(a) => {
+                if let Some(id) = a.task_id {
+                    let task = self.jobs.get_owned(&p.id, id).map_err(Failure::from)?;
                     Ok(self
                         .jobs
-                        .report(&task, seconds(&args, "wait_seconds", 0, 30, 0)?)
+                        .report(&task, a.wait_seconds.map(|n| n.get()).unwrap_or(0))
                         .await)
-                }
-                _ => bail!("Unknown Tasks action; use list or get"),
-            };
-        }
-        let cwd = self.cwd(&args, principal)?;
-        if matches!(name, "Read" | "Glob" | "Grep") {
-            let name = name.to_string();
-            return tokio::task::spawn_blocking(move || {
-                if name == "Read" {
-                    files::read_with_policy(&cwd, &args, Some(&policy))
                 } else {
-                    files::search_with_policy(&name, &cwd, &args, Some(&policy))
+                    Ok(self.jobs.list(
+                        &p.id,
+                        &self.cwd(a.cwd.as_deref(), p)?,
+                        a.limit.map(|n| n.get()).unwrap_or(5) as usize,
+                    ))
                 }
-            })
-            .await?;
+            }
+            Operation::Cancel(a) => {
+                let task = self
+                    .jobs
+                    .get_owned(&p.id, a.task_id)
+                    .map_err(Failure::from)?;
+                self.jobs.cancel(&task).map_err(Failure::from)?;
+                Ok(self.jobs.report(&task, 10).await)
+            }
+            Operation::Poll(a) => {
+                let task = self
+                    .jobs
+                    .get_owned(&p.id, a.task_id)
+                    .map_err(Failure::from)?;
+                self.jobs
+                    .poll(
+                        &task,
+                        a.wait_seconds.map(|n| n.get()).unwrap_or(0),
+                        a.stdout_offset.unwrap_or(0),
+                        a.stderr_offset.unwrap_or(0),
+                        a.limit.map(|n| n.get()).unwrap_or(12000) as usize,
+                    )
+                    .await
+                    .map_err(Failure::from)
+            }
+            Operation::Input(a) => {
+                let task = self
+                    .jobs
+                    .get_owned(&p.id, a.task_id)
+                    .map_err(Failure::from)?;
+                self.jobs
+                    .input(&task, &a.text, a.eof)
+                    .await
+                    .map_err(Failure::from)?;
+                Ok(json!({"task_id":a.task_id,"accepted_bytes":a.text.len(),"stdin_closed":a.eof}))
+            }
         }
-        ensure!(
-            matches!(name, "Write" | "Edit" | "Shell" | "ApplyPatch"),
-            "Unknown tool"
-        );
-        if matches!(name, "Write" | "Edit") {
-            policy.check(&files::resolve(&cwd, files::text_arg(&args, "path")?))?;
-        }
-        if name == "Shell" {
-            ensure!(
-                !files::text_arg(&args, "command")?.trim().is_empty(),
-                "command must not be empty"
-            );
-            seconds(&args, "timeout_seconds", 600, 86400, 1)?;
-        }
-        let wait = if name == "Shell" {
-            seconds(&args, "wait_seconds", 10, 30, 0)?
-        } else {
-            10
-        };
-        let map = args
-            .as_object_mut()
-            .context("arguments must be an object")?;
-        let id = map
-            .remove("operation_id")
-            .map(|v| {
-                Uuid::parse_str(v.as_str().context("operation_id must be a UUID")?)
-                    .map_err(anyhow::Error::from)
-            })
-            .transpose()?;
-        map.remove("cwd");
-        map.remove("wait_seconds");
+    }
+    async fn submit(
+        &self,
+        p: &Principal,
+        work: Work,
+        cwd: PathBuf,
+        policy: Policy,
+        id: Option<Uuid>,
+        wait: u64,
+    ) -> Result<Value> {
         let (task, created) = self
             .jobs
-            .start_owned(&principal.id, name, &cwd, &args, id)?;
+            .start_owned(
+                &p.id,
+                work.name(),
+                &cwd,
+                &serde_json::to_value(&work).expect("work"),
+                id,
+            )
+            .map_err(Failure::from)?;
         if created {
             let jobs = self.jobs.clone();
             let task = task.clone();
-            let name = name.to_string();
             tokio::spawn(async move {
                 let permit = tokio::select! {
-                    permit=jobs.slots.clone().acquire_owned()=>match permit {
-                        Ok(p)=>p,Err(_)=>{jobs.finish(&task,"failed",json!({"error":"Executor is shutting down"}));return;}
-                    },
-                    _=task.cancel.cancelled()=>{jobs.finish(&task,"cancelled",json!({"not_started":true}));return;}
+                    permit=jobs.slots.clone().acquire_owned()=>match permit {Ok(p)=>p,Err(_)=>{jobs.finish(&task,State::Interrupted,json!({"error":Failure::new(Code::InvalidState,"Executor is shutting down","Inspect Tasks after reconnecting.")}));return;}},
+                    _=task.cancel.cancelled()=>{jobs.finish(&task,State::Cancelled,json!({"not_started":true}));return;}
                 };
-                let outcome = if name == "Shell" {
-                    process::shell(jobs.clone(), task.clone(), args).await
+                let _gate = if matches!(&work, Work::Shell(_)) {
+                    None
                 } else {
-                    let _gate = jobs.mutation_gate.lock().await;
-                    match tokio::task::spawn_blocking(move || {
-                        if name == "ApplyPatch" {
-                            patch::apply_with_policy(&cwd, &args, Some(&policy))
-                        } else {
-                            files::mutate(&name, &cwd, &args)
-                        }
+                    Some(tokio::select! {
+                        gate=jobs.mutation_gate.lock()=>gate,
+                        _=task.cancel.cancelled()=>{jobs.finish(&task,State::Cancelled,json!({"not_started":true}));return;}
+                    })
+                };
+                match jobs.running(&task) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        jobs.finish(&task, State::Cancelled, json!({"not_started":true}));
+                        return;
+                    }
+                    Err(e) => {
+                        jobs.finish(&task, State::Failed, json!({"error":Failure::from(e)}));
+                        return;
+                    }
+                }
+                let outcome: Result<(State, Value)> = if let Work::Shell(a) = work {
+                    crate::process::shell(jobs.clone(), task.clone(), a)
+                        .await
+                        .map_err(Failure::from)
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        let r = match work {
+                            Work::Write(a) => {
+                                check(&policy, &files::resolve(&cwd, &a.path))?;
+                                files::write(&cwd, &a)
+                            }
+                            Work::Edit(a) => {
+                                check(&policy, &files::resolve(&cwd, &a.path))?;
+                                files::edit(&cwd, &a)
+                            }
+                            Work::Patch(a) => {
+                                crate::patch::apply_with_policy(&cwd, &a, Some(&policy))
+                                    .map_err(Failure::from)
+                            }
+                            Work::Shell(_) => unreachable!(),
+                        }?;
+                        Ok((
+                            if r.success {
+                                State::Completed
+                            } else {
+                                State::Failed
+                            },
+                            json!(r),
+                        ))
                     })
                     .await
-                    {
-                        Ok(result) => result.map(|value| ("completed".to_string(), value)),
-                        Err(error) => Err(error.into()),
-                    }
+                    .map_err(|e| Failure::from(anyhow::Error::from(e)))
+                    .and_then(|r| r)
                 };
                 match outcome {
-                    Ok((status, result)) => jobs.finish(&task, &status, result),
-                    Err(error) => {
-                        jobs.finish(&task, "failed", json!({"error":format!("{error:#}")}))
-                    }
+                    Ok((state, result)) => jobs.finish(&task, state, result),
+                    Err(e) => jobs.finish(&task, State::Failed, json!({"error":e})),
                 }
                 drop(permit);
             });
         }
         Ok(self.jobs.report(&task, wait).await)
     }
+}
+fn check(policy: &Policy, path: &Path) -> Result<()> {
+    policy.check(path).map_err(|e| {
+        Failure::new(
+            Code::PermissionDenied,
+            e.to_string(),
+            "Choose a granted workspace path outside protected executor data.",
+        )
+    })
 }

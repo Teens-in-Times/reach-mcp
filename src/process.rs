@@ -1,6 +1,6 @@
 use crate::{
     SshConfig,
-    jobs::{Jobs, Task},
+    jobs::{Jobs, State, Task},
 };
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
-mod tree {
+pub(crate) mod tree {
     use super::*;
     use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::*};
 
@@ -25,6 +25,13 @@ mod tree {
         }
     }
     pub fn attach(child: &tokio::process::Child) -> Result<Owner> {
+        attach_handle(
+            child
+                .raw_handle()
+                .context("Child process has no Windows handle")?,
+        )
+    }
+    pub fn attach_handle(process: std::os::windows::io::RawHandle) -> Result<Owner> {
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             anyhow::ensure!(
@@ -45,9 +52,6 @@ mod tree {
                 "SetInformationJobObject failed: {}",
                 std::io::Error::last_os_error()
             );
-            let process = child
-                .raw_handle()
-                .context("Child process has no Windows handle")?;
             anyhow::ensure!(
                 AssignProcessToJobObject(handle, process as _) != 0,
                 "AssignProcessToJobObject failed: {}",
@@ -59,7 +63,7 @@ mod tree {
 }
 
 #[cfg(not(windows))]
-mod tree {
+pub(crate) mod tree {
     use super::*;
     pub struct Owner;
     pub fn attach(_: &tokio::process::Child) -> Result<Owner> {
@@ -111,22 +115,23 @@ async fn capture(mut input: impl AsyncRead + Unpin, path: PathBuf) -> Result<Cap
     Ok(result)
 }
 
-pub async fn shell(jobs: Arc<Jobs>, task: Arc<Task>, args: Value) -> Result<(String, Value)> {
+pub async fn shell(
+    jobs: Arc<Jobs>,
+    task: Arc<Task>,
+    args: crate::operation::ShellArgs,
+) -> Result<(State, Value)> {
     let (id, cwd) = {
         let record = task.record.lock().expect("task");
         (record.task_id, record.cwd.clone())
     };
-    let command = crate::files::text_arg(&args, "command")?;
-    let timeout = args
-        .get("timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(600);
+    let command = &args.command;
+    let timeout = args.timeout_seconds.map(|n| n.get()).unwrap_or(600);
     let mut shell = Command::new(if cfg!(windows) {
         "powershell.exe"
     } else {
         "bash"
     });
-    let keep_stdin = crate::files::flag(&args, "keep_stdin")?;
+    let keep_stdin = args.keep_stdin;
     if cfg!(windows) {
         shell.args(["-NoProfile", "-NoLogo"]);
         if !keep_stdin {
@@ -162,27 +167,31 @@ pub async fn shell(jobs: Arc<Jobs>, task: Arc<Task>, args: Value) -> Result<(Str
     let out = tokio::spawn(capture(child.stdout.take().context("stdout")?, out_path));
     let err = tokio::spawn(capture(child.stderr.take().context("stderr")?, err_path));
     let (state, status) = tokio::select! {
-        status=child.wait()=> ("completed",status?),
+        status=child.wait()=> (State::Completed,status?),
         _=task.cancel.cancelled()=> {
             task.stdin.lock().await.take();
             drop(owner);
             let _=child.kill().await;
             let status=child.wait().await?;
-            return collect("cancelled",status.code(),pid,out,err).await;
+            return collect(State::Cancelled,status.code(),pid,out,err).await;
         },
         _=tokio::time::sleep(Duration::from_secs(timeout))=> {
             task.stdin.lock().await.take();
             drop(owner);
             let _=child.kill().await;
             let status=child.wait().await?;
-            return collect("timed_out",status.code(),pid,out,err).await;
+            return collect(State::TimedOut,status.code(),pid,out,err).await;
         }
     };
     // Closing this task's job also closes any descendants still holding output pipes.
     task.stdin.lock().await.take();
     drop(owner);
     collect(
-        if status.success() { state } else { "failed" },
+        if status.success() {
+            state
+        } else {
+            State::Failed
+        },
         status.code(),
         pid,
         out,
@@ -192,16 +201,16 @@ pub async fn shell(jobs: Arc<Jobs>, task: Arc<Task>, args: Value) -> Result<(Str
 }
 
 async fn collect(
-    state: &str,
+    state: State,
     code: Option<i32>,
     pid: Option<u32>,
     out: tokio::task::JoinHandle<Result<Capture>>,
     err: tokio::task::JoinHandle<Result<Capture>>,
-) -> Result<(String, Value)> {
+) -> Result<(State, Value)> {
     let out = out.await??;
     let err = err.await??;
     Ok((
-        state.into(),
+        state,
         json!({"exit_code":code,"pid":pid,
         "stdout":String::from_utf8_lossy(&out.preview),"stderr":String::from_utf8_lossy(&err.preview),
         "stdout_bytes":out.total,"stderr_bytes":err.total,
