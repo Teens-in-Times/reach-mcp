@@ -298,23 +298,40 @@ async fn file_capabilities_cannot_read_credentials_or_escape_workspace() {
         )
         .await
         .unwrap();
-    assert!(read["files"][0]["text"].as_str().unwrap().contains("hello"));
-    assert!(read["files"][1]["error"].is_string());
+    let crate::operation::Reply::Read(read) = read else {
+        panic!("wrong reply")
+    };
+    assert!(matches!(&read.files[0],crate::files::ReadEntry::Text(f)if f.text.contains("hello")));
+    assert!(
+        matches!(&read.files[1],crate::files::ReadEntry::Error(f)if f.error.code==crate::error::Code::PermissionDenied)
+    );
     let found = f
         .hand
         .execute_for(&p, "Grep", json!({"pattern":"NEVER_LEAK_PRIVATE_MARKER"}))
         .await
         .unwrap();
-    assert_eq!(found["matches"].as_array().unwrap().len(), 0);
+    let crate::operation::Reply::Grep(found) = found else {
+        panic!("wrong reply")
+    };
+    assert!(found.matches.is_empty());
     let listing = f
         .hand
         .execute_for(&p, "Read", json!({"paths":["."]}))
         .await
         .unwrap();
-    assert!(!listing.to_string().contains(".private"));
+    let crate::operation::Reply::Read(listing) = listing else {
+        panic!("wrong reply")
+    };
+    assert!(
+        matches!(&listing.files[0],crate::files::ReadEntry::Directory(d)if !d.entries.iter().any(|e|e.name==".private"))
+    );
     assert!(
         f.hand
-            .execute_for(&p, "Write", json!({"path":"bad","content":"bad"}))
+            .execute_for(
+                &p,
+                "Write",
+                json!({"path":"bad","update":{"mode":"create","content":"bad"}})
+            )
             .await
             .is_err()
     );
@@ -325,7 +342,7 @@ async fn file_capabilities_cannot_read_credentials_or_escape_workspace() {
             .execute_for(
                 &p,
                 "Write",
-                json!({"path":f.config.auth_file,"content":"bad"})
+                json!({"path":f.config.auth_file,"update":{"mode":"create","content":"bad"}})
             )
             .await
             .is_err()
@@ -338,8 +355,8 @@ async fn file_capabilities_cannot_read_credentials_or_escape_workspace() {
                 json!({"patch":"*** Begin Patch\n*** Add File: .private/new\n+bad\n*** End Patch"})
             )
             .await
-            .unwrap()["status"]
-            == "failed"
+            .unwrap()
+            .execution_failed()
     );
     assert!(!f.config.auth_file.parent().unwrap().join("new").exists());
 }

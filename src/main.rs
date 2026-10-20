@@ -353,6 +353,17 @@ async fn main() -> Result<()> {
         audit,
         terminals: terminals.clone(),
     };
+    let cleanup_jobs = jobs.clone();
+    let cleanup_stop = stop.clone();
+    let maintenance = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {_=cleanup_stop.cancelled()=>break,_=interval.tick()=>{
+                let jobs=cleanup_jobs.clone();
+                if let Err(error)=tokio::task::spawn_blocking(move||jobs.cleanup()).await.unwrap_or_else(|e|Err(reach_mcp::error::Failure::new(reach_mcp::error::Code::Internal,e.to_string(),"Inspect cleanup worker."))){eprintln!("Background task cleanup failed: {error}");}
+            }}
+        }
+    });
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let admin_server = if let Some(admin) = config.admin.clone() {
         let listener = tokio::net::TcpListener::bind(admin.listen).await?;
@@ -382,6 +393,7 @@ async fn main() -> Result<()> {
         .await;
     stop.cancel();
     jobs.cancel_all();
+    maintenance.await?;
     tokio::task::spawn_blocking(move || terminals.shutdown()).await?;
     for _ in 0..100 {
         if jobs.active_count() == 0 {

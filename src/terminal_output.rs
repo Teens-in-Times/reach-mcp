@@ -127,6 +127,22 @@ impl Output {
     pub fn application_cursor(&self) -> bool {
         self.parser.screen().application_cursor()
     }
+    pub fn screen_version(&self) -> String {
+        let s = self.parser.screen();
+        let (rows, cols) = s.size();
+        hash(
+            format!(
+                "{}:{}:{:?}:{}:{}:{}",
+                rows,
+                cols,
+                s.cursor_position(),
+                s.alternate_screen(),
+                s.hide_cursor(),
+                s.contents()
+            )
+            .as_bytes(),
+        )
+    }
     pub fn stream(&self, cursor: u64, limit: usize) -> Result<Stream> {
         if cursor > self.end {
             return Err(Failure::new(
@@ -168,17 +184,7 @@ impl Output {
             return Err(Failure::invalid("start_row exceeds terminal height"));
         }
         let cursor = s.cursor_position();
-        let text = s.contents();
-        let version = hash(
-            format!(
-                "{}:{}:{cursor:?}:{}:{}:{text}",
-                rows,
-                cols,
-                s.alternate_screen(),
-                s.hide_cursor()
-            )
-            .as_bytes(),
-        );
+        let version = self.screen_version();
         if since == Some(&version) {
             return Ok(None);
         }

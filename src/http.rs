@@ -95,56 +95,30 @@ impl ServerHandler for Hand {
             ));
         }
         let mut audit_operation = name.clone();
-        let outcome: crate::error::Result<Value> = async {
-            if p.profile==Profile::Compact && name=="Discover" {
+        let outcome:crate::error::Result<(Value,bool,Option<ContentBlock>)>=async {
+            if p.profile==Profile::Compact&&name=="Discover" {
                 let args:crate::operation::DiscoverArgs=serde_json::from_value(arguments.clone()).map_err(|e|crate::error::Failure::invalid(e.to_string()))?;
                 let allowed:Vec<Tool>=catalog::tools().into_iter().filter(|t|p.allows(&t.name)).collect();
-                return if let Some(name)=args.tool {
-                    allowed.into_iter().find(|t|t.name==name).map(|t|serde_json::to_value(t).expect("tool"))
-                        .ok_or_else(||crate::error::Failure::invalid("Unknown or unavailable operation"))
-                } else {Ok(json!({"operations":allowed.iter().map(|t|json!({"name":t.name,"description":t.description})).collect::<Vec<_>>()}))};
+                let value=if let Some(name)=args.tool {allowed.into_iter().find(|t|t.name==name).map(|t|serde_json::to_value(t).expect("tool")).ok_or_else(||crate::error::Failure::invalid("Unknown or unavailable operation"))?}
+                    else{json!({"operations":allowed.iter().map(|t|json!({"name":t.name,"description":t.description})).collect::<Vec<_>>()})};
+                return Ok((value,false,None));
             }
             let (operation,args)=if p.profile==Profile::Compact {
-                let args:crate::operation::RunArgs=serde_json::from_value(arguments).map_err(|e|crate::error::Failure::invalid(e.to_string()))?;
-                (args.tool,args.arguments)
-            } else {(name.clone(),arguments)};
-            audit_operation=operation.clone();
-            self.execute_for(&p,&operation,args).await
+                let args:crate::operation::RunArgs=serde_json::from_value(arguments).map_err(|e|crate::error::Failure::invalid(e.to_string()))?;(args.tool,Value::Object(args.arguments))
+            }else{(name.clone(),arguments)};
+            audit_operation=operation.clone();let reply=self.execute_for(&p,&operation,args).await?;
+            let image=reply.image().map(|i|serde_json::from_value(json!({"type":"image","data":i.data,"mimeType":i.mime_type})).expect("native image block"));
+            Ok((serde_json::to_value(&reply).expect("typed reply"),reply.execution_failed(),image))
         }.await;
-        let (mut value, error) = match outcome {
-            Ok(value) => {
-                let failed = !matches!(audit_operation.as_str(), "Tasks" | "Poll" | "Cancel")
-                    && value
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| {
-                            matches!(
-                                s,
-                                "failed"
-                                    | "timed_out"
-                                    | "cancelled"
-                                    | "interrupted"
-                                    | "unknown"
-                                    | "expired"
-                            )
-                        });
-                (value, failed)
-            }
-            Err(error) => (json!({"kind":"rejected","error":error}), true),
+        let (value, error, image) = match outcome {
+            Ok(r) => r,
+            Err(error) => (json!({"kind":"rejected","error":error}), true, None),
         };
         let operation = audit_operation;
         if let Err(e) = self.audit.record(&p, &operation, started, !error) {
             eprintln!("Audit write failed: {e}");
         }
-        let mut blocks = Vec::new();
-        if let Some(data) = value.as_object_mut().and_then(|v| v.remove("image_base64")) {
-            blocks.push(
-                serde_json::from_value(
-                    json!({"type":"image","data":data,"mimeType":value["mime_type"]}),
-                )
-                .map_err(|_| ErrorData::internal_error("Image encoding failed", None))?,
-            );
-        }
+        let mut blocks: Vec<ContentBlock> = image.into_iter().collect();
         blocks.insert(0, ContentBlock::text(value.to_string()));
         let mut result = CallToolResult::success(blocks);
         result.structured_content = Some(value);

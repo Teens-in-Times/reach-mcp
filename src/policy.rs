@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use crate::error::{Code, Failure, Result};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone)]
@@ -7,13 +7,17 @@ pub struct Policy {
     denied: Vec<PathBuf>,
 }
 fn normalize(path: &Path) -> Result<PathBuf> {
-    ensure!(path.is_absolute(), "Filesystem path must be absolute");
+    if !path.is_absolute() {
+        return Err(Failure::invalid("Filesystem path must be absolute"));
+    }
     let mut clean = PathBuf::new();
     for part in path.components() {
         match part {
             Component::CurDir => {}
             Component::ParentDir => {
-                ensure!(clean.pop(), "Path escapes its root");
+                if !clean.pop() {
+                    return Err(Failure::invalid("Path escapes its root"));
+                }
             }
             _ => clean.push(part.as_os_str()),
         }
@@ -24,10 +28,12 @@ fn normalize(path: &Path) -> Result<PathBuf> {
         suffix.push(
             ancestor
                 .file_name()
-                .context("Cannot resolve path")?
+                .ok_or_else(|| Failure::invalid("Cannot resolve path"))?
                 .to_owned(),
         );
-        ancestor = ancestor.parent().context("Missing path ancestor")?;
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| Failure::invalid("Missing path ancestor"))?;
     }
     let mut result = std::fs::canonicalize(ancestor)?;
     for part in suffix.into_iter().rev() {
@@ -53,6 +59,13 @@ fn within(path: &Path, root: &Path) -> bool {
         )
 }
 impl Policy {
+    #[cfg(test)]
+    pub fn unrestricted_for_test(root: &Path) -> Self {
+        Self {
+            roots: vec![std::fs::canonicalize(root).unwrap()],
+            denied: vec![],
+        }
+    }
     pub fn new(config: &crate::Config, p: &crate::auth::Principal) -> Result<Self> {
         let roots = if p.roots.is_empty() {
             vec![config.default_cwd.clone()]
@@ -68,6 +81,10 @@ impl Policy {
             config.state_dir.clone(),
             std::env::current_exe()?,
         ];
+        if let Some(directory) = std::env::current_exe()?.parent() {
+            denied.push(directory.join("conpty.dll"));
+            denied.push(directory.join("x64").join("OpenConsole.exe"));
+        }
         denied.extend(config.protected_paths.clone());
         if let Some(admin) = &config.admin {
             denied.push(admin.tickets_file.clone());
@@ -82,10 +99,13 @@ impl Policy {
     }
     pub fn check(&self, path: &Path) -> Result<()> {
         let actual = normalize(path)?;
-        ensure!(
-            self.allows_walk(&actual),
-            "Path is outside granted workspaces or belongs to protected executor data"
-        );
+        if !self.allows_walk(&actual) {
+            return Err(Failure::new(
+                Code::PermissionDenied,
+                "Path is outside granted workspaces or belongs to protected executor data",
+                "Choose a granted workspace path outside protected executor data.",
+            ));
+        }
         Ok(())
     }
     pub fn allows_walk(&self, path: &Path) -> bool {

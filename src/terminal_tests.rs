@@ -208,3 +208,185 @@ async fn windows_fullscreen_vt_and_output_overflow_are_readable_without_replayin
     m.close("a", id).unwrap();
     closed(&m, id).await;
 }
+
+#[tokio::test]
+async fn windows_pty_quota_bad_start_retention_and_descendants_are_bounded() {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let m = Terminals::with_limits(
+        root.path(),
+        terminal::Limits {
+            total: 1,
+            per_owner: 1,
+            retained: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let failed = m
+        .create(
+            "a",
+            root.path(),
+            args(json!({"program":"reach-does-not-exist.exe"})),
+        )
+        .unwrap();
+    assert_eq!(failed.state, State::Interrupted);
+    assert!(failed.error.is_some());
+    assert!(
+        m.create("a", root.path(), args(json!({"env":{"bad=name":"x"}})))
+            .is_err()
+    );
+    let file = root.path().join("pid.txt");
+    let script = format!(
+        "$p=Start-Process -FilePath powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Write-Output ('CHILD_'+'READY'); Start-Sleep -Seconds 60",
+        file.display()
+    );
+    let r = m
+        .create(
+            "a",
+            root.path(),
+            args(json!({"program":"powershell.exe","args":["-NoProfile","-Command",script]})),
+        )
+        .unwrap();
+    let id = r.terminal_id;
+    assert_eq!(
+        m.create("b", root.path(), args(json!({})))
+            .err()
+            .unwrap()
+            .code,
+        crate::error::Code::CapacityExceeded
+    );
+    screen(&m, "a", id, "CHILD_READY").await;
+    let pid: u32 = std::fs::read_to_string(&file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    m.close("a", id).unwrap();
+    closed(&m, id).await;
+    let alive = unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            false
+        } else {
+            let mut code = 0;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            ok != 0 && code == 259
+        }
+    };
+    assert!(!alive, "PTY descendant survived close");
+    m.sweep();
+    assert!(
+        m.list("a")
+            .iter()
+            .find(|r| r.terminal_id == failed.terminal_id)
+            .unwrap()
+            .output_expired
+    );
+    assert!(
+        m.read("a", args(json!({"terminal_id":failed.terminal_id})))
+            .await
+            .is_err()
+    );
+}
+#[tokio::test]
+async fn windows_pty_blocked_input_queue_reports_backpressure_and_close_releases_waiters() {
+    let root = tempfile::tempdir().unwrap();
+    let m = Terminals::open(root.path()).unwrap();
+    let r=m.create("a",root.path(),args(json!({"program":"powershell.exe","args":["-NoProfile","-Command","[Console]::WriteLine(('NO_'+'READ')); Start-Sleep -Seconds 60"]}))).unwrap();
+    let id = r.terminal_id;
+    screen(&m, "a", id, "NO_READ").await;
+    let mut calls = Vec::new();
+    for _ in 0..64 {
+        let m = m.clone();
+        calls.push(tokio::spawn(async move{m.input("a",args(json!({"terminal_id":id,"input_id":Uuid::new_v4(),"input":{"kind":"text","text":"x".repeat(8000)}}))).await}));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let closer = m.clone();
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        tokio::task::spawn_blocking(move || closer.close("a", id)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    closed(&m, id).await;
+    let mut rejected = 0;
+    for call in calls {
+        let r = tokio::time::timeout(Duration::from_secs(8), call)
+            .await
+            .unwrap()
+            .unwrap();
+        match r {
+            Err(e) => {
+                assert!(matches!(
+                    e.code,
+                    crate::error::Code::CapacityExceeded | crate::error::Code::InvalidState
+                ));
+                rejected += 1;
+            }
+            Ok(r) => assert!(!matches!(r.delivery, terminal::Delivery::Queued)),
+        }
+    }
+    assert!(
+        rejected > 0,
+        "No backpressure was observed under a blocked PTY input flood"
+    );
+}
+
+#[tokio::test]
+async fn windows_pty_concurrent_open_close_never_resurrects_a_closed_session() {
+    let root = tempfile::tempdir().unwrap();
+    let m = Terminals::open(root.path()).unwrap();
+    for _ in 0..3 {
+        let id = Uuid::new_v4();
+        let manager = m.clone();
+        let cwd = root.path().to_owned();
+        let opening = tokio::task::spawn_blocking(move || {
+            manager.create("a", &cwd, args(json!({"operation_id":id})))
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while !m.list("a").iter().any(|r| r.terminal_id == id) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        let manager = m.clone();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            tokio::task::spawn_blocking(move || manager.close("a", id)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        opening.await.unwrap().unwrap();
+        closed(&m, id).await;
+        let retry = m
+            .create("a", root.path(), args(json!({"operation_id":id})))
+            .unwrap();
+        assert!(!matches!(
+            retry.state,
+            State::Starting | State::Running | State::Closing
+        ));
+    }
+}
+
+#[tokio::test]
+async fn windows_pty_screen_pagination_validates_version_even_when_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+    let m = Terminals::open(root.path()).unwrap();
+    let r=m.create("a",root.path(),args(json!({"program":"powershell.exe","args":["-NoProfile","-Command","[Console]::WriteLine(('PAGE_'+'READY')); Start-Sleep -Seconds 30"]}))).unwrap();
+    let id = r.terminal_id;
+    let first = screen(&m, "a", id, "PAGE_READY").await.screen.unwrap();
+    let next=m.read("a",args(json!({"terminal_id":id,"start_row":1,"rows":1,"since_screen":first.version,"expected_screen":first.version}))).await.unwrap();
+    assert_eq!(next.screen.unwrap().start_row, 1);
+    let stale=m.read("a",args(json!({"terminal_id":id,"since_screen":first.version,"expected_screen":"incorrect"}))).await.err().unwrap();
+    assert_eq!(stale.code, crate::error::Code::Conflict);
+    m.close("a", id).unwrap();
+    closed(&m, id).await;
+}

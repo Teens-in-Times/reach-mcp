@@ -4,7 +4,7 @@ Standalone Rust MCP server. Do not depend on another executor, agent, or Python 
 
 The calling client owns user approval. This process validates authentication, authorization, argument contracts and task ownership, then executes accepted operations.
 
-`auth` owns credential identity and revocation; `operation` owns the single operation registry and argument types; `catalog` derives discovery and the initialization guide from those types; `engine` dispatches typed operations; `http` owns MCP/HTTP; `jobs` owns durable command/mutation tasks; `changes` owns file plans and commit receipts; `terminal` owns persistent PTYs, `terminal_output` owns bounded streams and VT screens, and `windows_pty` owns native Windows process/ConPTY handles.
+`auth` owns credential identity and revocation; `operation` owns the single operation registry, argument/result contracts and generated dispatch; `catalog` derives discovery and the initialization guide from those types; `engine` owns typed handlers and scheduling; `http` owns MCP/HTTP; `jobs` owns durable command/mutation phases and bounded logs; `files` and `patch` plan changes; `changes` owns exclusive commits and per-file receipts; `journal` owns durable before-images and guarded recovery; `terminal` owns persistent PTYs, `terminal_output` owns bounded streams and VT screens, and `windows_pty` owns native Windows process/ConPTY handles.
 
 Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked`. Auth/ownership changes require HTTP tests, not only helper tests. Keep secrets, private config, task logs, generated binaries and state out of Git and release archives. Never mutate a running deployment while testing; use a separate listener and private state.
 

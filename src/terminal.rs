@@ -51,6 +51,8 @@ pub struct ReadArgs {
     pub cursor: Option<u64>,
     pub view: Option<View>,
     pub since_screen: Option<String>,
+    /// Require a specific screen version while paging; a changed screen returns conflict.
+    pub expected_screen: Option<String>,
     pub start_row: Option<Number<0, 119>>,
     pub rows: Option<Number<1, 120>>,
     pub limit: Option<Limit>,
@@ -195,6 +197,7 @@ pub struct Limits {
     pub idle: Duration,
     pub retention: Duration,
     pub output_bytes: usize,
+    pub retained: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -204,6 +207,7 @@ impl Default for Limits {
             idle: Duration::from_secs(1800),
             retention: Duration::from_secs(3600),
             output_bytes: 1024 * 1024,
+            retained: 64,
         }
     }
 }
@@ -249,6 +253,9 @@ fn save(root: &Path, r: &Record) -> Result<()> {
     Ok(())
 }
 impl Session {
+    fn touch(&self) {
+        self.record.lock().expect("terminal").last_client_ms = now();
+    }
     fn update(&self, f: impl FnOnce(&mut Record)) {
         let mut r = self.record.lock().expect("terminal");
         f(&mut r);
@@ -267,8 +274,30 @@ impl Session {
         });
         let controls = self.controls.lock().expect("controls").take();
         if let Some(mut c) = controls {
-            let _ = c.killer.kill();
+            if let Err(e) = c.killer.kill() {
+                self.update(|r| {
+                    r.error = Some(Failure::new(
+                        Code::Io,
+                        e.to_string(),
+                        "Terminal termination failed; inspect lifecycle and OS process state.",
+                    ))
+                });
+            }
             drop(c);
+        }
+        for sent in self.inputs.lock().expect("inputs").values() {
+            let mut delivery = sent.delivery.lock().expect("delivery");
+            if matches!(delivery.0, Delivery::Queued) {
+                *delivery = (
+                    Delivery::Unknown,
+                    Some(Failure::new(
+                        Code::Interrupted,
+                        "Terminal closed before input delivery was confirmed",
+                        "Inspect the final screen; input may have been partly delivered and must not be blindly resent.",
+                    )),
+                );
+                sent.changed.notify_waiters();
+            }
         }
     }
 }
@@ -277,6 +306,15 @@ impl Terminals {
         Self::with_limits(state, Limits::default())
     }
     pub fn with_limits(state: &Path, limits: Limits) -> Result<Arc<Self>> {
+        if limits.total == 0
+            || limits.per_owner == 0
+            || limits.output_bytes < 4
+            || limits.retained == 0
+        {
+            return Err(Failure::invalid(
+                "Terminal limits must be positive and output capacity at least 4 bytes",
+            ));
+        }
         let root = state.join("terminals");
         fs::create_dir_all(&root)?;
         let mut sessions = HashMap::new();
@@ -284,6 +322,13 @@ impl Terminals {
             let path = entry?.path();
             if path.extension().and_then(|p| p.to_str()) != Some("json") {
                 continue;
+            }
+            if sessions.len() >= 10000 || fs::metadata(&path)?.len() > 65536 {
+                return Err(Failure::new(
+                    Code::CapacityExceeded,
+                    "Terminal metadata ledger exceeds limits",
+                    "Inspect private state or choose a new state namespace.",
+                ));
             }
             let stored: Stored = serde_json::from_slice(&fs::read(path)?).map_err(|e| {
                 Failure::new(
@@ -349,6 +394,7 @@ impl Terminals {
         Ok(s)
     }
     pub fn create(&self, owner: &str, cwd: &Path, mut a: OpenArgs) -> Result<Record> {
+        self.sweep();
         if self.stopped.load(Ordering::SeqCst) {
             return Err(Failure::new(
                 Code::InvalidState,
@@ -360,6 +406,13 @@ impl Terminals {
         let id = a.operation_id.take().unwrap_or_else(Uuid::new_v4);
         let fingerprint = hash(&serde_json::to_vec(&(owner, cwd, &a)).expect("terminal args"));
         let mut sessions = self.sessions.lock().expect("terminals");
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(Failure::new(
+                Code::InvalidState,
+                "Terminal system is shutting down",
+                "Reconnect after restart.",
+            ));
+        }
         if let Some(s) = sessions.get(&id) {
             let r = s.record.lock().expect("terminal");
             if r.owner != owner {
@@ -399,8 +452,14 @@ impl Terminals {
         };
         let program = a.program.as_deref().unwrap_or(default_program);
         if program.is_empty()
+            || program.contains('\0')
+            || !cwd.is_absolute()
+            || !cwd.is_dir()
+            || a.args.iter().any(|s| s.contains('\0'))
             || a.args.len() > 128
             || a.env.len() > 128
+            || a.env.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() > 16384
+            || a.args.iter().map(String::len).sum::<usize>() > 24000
             || a.env
                 .iter()
                 .any(|(k, v)| k.contains(['=', '\0']) || k.is_empty() || v.contains('\0'))
@@ -481,7 +540,7 @@ impl Terminals {
     }
     pub async fn read(&self, owner: &str, a: ReadArgs) -> Result<ReadReceipt> {
         let s = self.get(owner, a.terminal_id)?;
-        s.update(|r| r.last_client_ms = now());
+        s.touch();
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(a.wait_seconds.map(|n| n.get()).unwrap_or(0));
         loop {
@@ -491,11 +550,23 @@ impl Terminals {
             let r = s.record.lock().expect("terminal").clone();
             let (screen, stream, changed) = {
                 let o = s.output.lock().expect("output");
-                let o=o.as_ref().ok_or_else(||Failure::new(Code::CursorInvalid,"Terminal output expired or executor restarted","Use Terminals for lifecycle metadata. A previous PTY is never silently recreated."))?;
+                let o=o.as_ref().ok_or_else(||Failure::new(Code::OutputExpired,"Terminal output expired or executor restarted","Use Terminals for lifecycle metadata. A previous PTY is never silently recreated."))?;
                 let view = a.view.as_ref().unwrap_or(&View::Screen);
+                if a.expected_screen
+                    .as_deref()
+                    .is_some_and(|v| v != o.screen_version())
+                {
+                    return Err(Failure::conflict(
+                        "Terminal screen changed during pagination; start again at row 0",
+                    ));
+                }
                 let screen = if matches!(view, View::Screen | View::Both) {
                     o.screen(
-                        a.since_screen.as_deref(),
+                        if a.start_row.is_some_and(|n| n.get() > 0) {
+                            None
+                        } else {
+                            a.since_screen.as_deref()
+                        },
                         a.start_row.map(|n| n.get() as u16).unwrap_or(0),
                         a.rows.map(|n| n.get() as u16).unwrap_or(120),
                     )?
@@ -529,7 +600,9 @@ impl Terminals {
             return Err(Failure::invalid("Terminal input exceeds 8 KiB"));
         }
         let id = a.input_id.unwrap_or_else(Uuid::new_v4);
-        let fingerprint = hash(&bytes);
+        // Hash semantic input before terminal modes encode it; retrying after a mode change
+        // must recover the original delivery rather than conflict or send different bytes.
+        let fingerprint = hash(&serde_json::to_vec(&a.input).expect("terminal input"));
         let sent = {
             let mut inputs = s.inputs.lock().expect("terminal inputs");
             if let Some(sent) = inputs.get(&id) {
@@ -568,7 +641,7 @@ impl Terminals {
                 sent
             }
         };
-        s.update(|r| r.last_client_ms = now());
+        s.touch();
         let notified = sent.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -622,6 +695,11 @@ impl Terminals {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut sessions = sessions;
+        sessions.sort_by_key(|s| {
+            std::cmp::Reverse(s.record.lock().expect("terminal").ended_ms.unwrap_or(0))
+        });
+        let mut retained = 0;
         for s in sessions {
             let r = s.record.lock().expect("terminal").clone();
             if r.state == State::Running
@@ -631,13 +709,16 @@ impl Terminals {
             }
             if !r.state.active()
                 && !r.output_expired
-                && r.ended_ms.is_some_and(|end| {
-                    now().saturating_sub(end) > self.limits.retention.as_millis() as u64
-                })
+                && (retained >= self.limits.retained
+                    || r.ended_ms.is_some_and(|end| {
+                        now().saturating_sub(end) > self.limits.retention.as_millis() as u64
+                    }))
             {
                 s.output.lock().expect("output").take();
                 s.inputs.lock().expect("inputs").clear();
                 s.update(|r| r.output_expired = true);
+            } else if !r.state.active() && !r.output_expired {
+                retained += 1;
             }
         }
     }
@@ -645,6 +726,30 @@ impl Terminals {
         self.stopped.store(true, Ordering::SeqCst);
         for s in self.sessions.lock().expect("terminals").values() {
             s.close(State::Closed);
+        }
+    }
+}
+#[derive(Debug, Serialize)]
+pub struct Backend {
+    pub implementation: String,
+    pub available: bool,
+    pub alternate_screen: bool,
+    pub process_tree_owned_before_start: bool,
+    pub error: Option<String>,
+}
+pub fn backend() -> Backend {
+    #[cfg(windows)]
+    {
+        crate::windows_pty::capabilities()
+    }
+    #[cfg(not(windows))]
+    {
+        Backend {
+            implementation: "unix_pty_unverified".into(),
+            available: true,
+            alternate_screen: true,
+            process_tree_owned_before_start: false,
+            error: None,
         }
     }
 }
@@ -745,11 +850,16 @@ fn spawn(s: Arc<Session>, command: CommandBuilder, rows: u16, cols: u16) -> Resu
                             .unwrap_or_default();
                         read_session.changed.notify_waiters();
                         for r in replies {
-                            let _ = responses.try_send(Message::Response(r));
+                            if responses.try_send(Message::Response(r)).is_err(){read_session.update(|r|r.error=Some(Failure::new(Code::CapacityExceeded,"Terminal response queue saturated","Reduce input traffic and inspect the screen; a terminal query response was dropped.")));}
                         }
                     }
                     Err(e) => {
-                        read_session.update(|r| r.error = Some(e.into()));
+                        if e.kind() != std::io::ErrorKind::BrokenPipe {
+                            read_session.update(|r|{r.error=Some(e.into());if r.state.active(){r.state=State::Closing;r.close_reason=Some(State::Interrupted);}});
+                            // Destroying ConPTY on its drain thread can deadlock shutdown.
+                            // Terminate the child here; the exit thread owns console teardown.
+                            if let Some(c)=read_session.controls.lock().expect("controls").as_mut(){let _=c.killer.kill();}
+                        }
                         break;
                     }
                 }

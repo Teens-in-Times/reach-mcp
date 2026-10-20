@@ -1,94 +1,152 @@
-//! A small, strict implementation of the familiar *** Begin Patch format.
-//! All edits are validated before writes. Each replacement is atomic; a multi-file
-//! patch is not a crash-atomic filesystem transaction.
-use anyhow::{Context, Result, bail, ensure};
+//! Strict contextual patch planning. Applying plans and reporting rollback belongs to changes.
+use crate::{
+    changes::{self, Change},
+    error::{Code, Failure, Result},
+    operation::PatchArgs,
+    policy::Policy,
+};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     path::{Component, Path, PathBuf},
 };
-
-use crate::changes::{Change, bytes};
-
-fn target(cwd: &Path, name: &str) -> Result<PathBuf> {
+#[derive(Clone)]
+struct Line {
+    body: String,
+    ending: &'static str,
+}
+fn lines(s: &str) -> Vec<Line> {
+    s.split_inclusive('\n')
+        .map(|s| {
+            if let Some(body) = s.strip_suffix("\r\n") {
+                Line {
+                    body: body.into(),
+                    ending: "\r\n",
+                }
+            } else if let Some(body) = s.strip_suffix('\n') {
+                Line {
+                    body: body.into(),
+                    ending: "\n",
+                }
+            } else {
+                Line {
+                    body: s.into(),
+                    ending: "",
+                }
+            }
+        })
+        .collect()
+}
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Add,
+    Update,
+    Delete,
+}
+fn target(cwd: &Path, name: &str, policy: &Policy) -> Result<PathBuf> {
     let relative = Path::new(name);
-    ensure!(
-        !name.is_empty()
-            && !relative.is_absolute()
-            && relative
-                .components()
-                .all(|c| matches!(c, Component::Normal(_))),
-        "Patch paths must be relative, without . or .."
-    );
+    if name.is_empty()
+        || relative.is_absolute()
+        || !relative
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(Failure::invalid(
+            "Patch paths must be relative, without . or ..",
+        ));
+    }
     let path = cwd.join(relative);
+    policy.check(&path)?;
     let mut ancestor = path.as_path();
     while !ancestor.exists() {
-        ancestor = ancestor.parent().context("Missing path parent")?;
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| Failure::invalid("Missing path parent"))?;
     }
-    ensure!(
-        fs::canonicalize(ancestor)?.starts_with(fs::canonicalize(cwd)?),
-        "Patch path leaves cwd through a link"
-    );
-    ensure!(!path.is_dir(), "Patch target is a directory");
+    if !fs::canonicalize(ancestor)?.starts_with(fs::canonicalize(cwd)?) {
+        return Err(Failure::new(
+            Code::PermissionDenied,
+            "Patch target leaves cwd through a link",
+            "Choose a path inside cwd.",
+        ));
+    }
+    if path.is_dir() {
+        return Err(Failure::invalid("Patch target is a directory"));
+    }
     Ok(path)
 }
-pub fn apply(cwd: &Path, args: &crate::operation::PatchArgs) -> Result<crate::changes::Receipt> {
-    apply_with_policy(cwd, args, None)
+fn key(p: &Path) -> String {
+    let p = p.to_string_lossy();
+    if cfg!(windows) {
+        p.to_lowercase()
+    } else {
+        p.into_owned()
+    }
 }
-pub fn apply_with_policy(
-    cwd: &Path,
-    args: &crate::operation::PatchArgs,
-    policy: Option<&crate::policy::Policy>,
-) -> Result<crate::changes::Receipt> {
-    let patch = &args.patch;
-    ensure!(patch.len() <= 1024 * 1024, "Patch exceeds 1 MiB");
-    let lines: Vec<&str> = patch.lines().collect();
-    ensure!(
-        lines.first() == Some(&"*** Begin Patch") && lines.last() == Some(&"*** End Patch"),
-        "Expected *** Begin Patch and *** End Patch"
-    );
-    let hashes = &args.expected_sha256;
-    let mut changes: Vec<Change> = Vec::new();
+pub fn plan(cwd: &Path, args: &PatchArgs, policy: &Policy) -> Result<Vec<Change>> {
+    if args.patch.len() > 1024 * 1024 {
+        return Err(Failure::invalid("Patch exceeds 1 MiB"));
+    }
+    let patch: Vec<_> = args.patch.lines().collect();
+    if patch.first() != Some(&"*** Begin Patch") || patch.last() != Some(&"*** End Patch") {
+        return Err(Failure::invalid(
+            "Expected *** Begin Patch and *** End Patch",
+        ));
+    }
+    let mut changes = Vec::new();
     let mut seen = HashSet::new();
     let mut i = 1;
-    while i + 1 < lines.len() {
-        ensure!(changes.len() < 100, "Patch exceeds 100 file operations");
-        let header = lines[i];
+    while i + 1 < patch.len() {
+        let header = patch[i];
         i += 1;
         let (kind, name) = if let Some(p) = header.strip_prefix("*** Add File: ") {
-            ("add", p)
+            (Kind::Add, p)
         } else if let Some(p) = header.strip_prefix("*** Update File: ") {
-            ("update", p)
+            (Kind::Update, p)
         } else if let Some(p) = header.strip_prefix("*** Delete File: ") {
-            ("delete", p)
+            (Kind::Delete, p)
         } else {
-            bail!("Unknown patch file header: {header}")
+            return Err(Failure::invalid(format!(
+                "Unknown patch file header: {header}"
+            )));
         };
-        let path = target(cwd, name)?;
-        if let Some(policy) = policy {
-            policy.check(&path)?;
+        let path = target(cwd, name, policy)?;
+        if !seen.insert(key(&path)) {
+            return Err(Failure::invalid("Duplicate patch target"));
         }
-        ensure!(seen.insert(path_key(&path)), "Duplicate patch target");
-        let before = bytes(&path)?;
-        if let Some(before) = &before {
-            crate::changes::verify(
-                hashes
-                    .get(name)
-                    .context("Existing patch source requires expected_sha256 from Read")?,
-                before,
+        let before = changes::bytes(&path)?;
+        if kind == Kind::Add {
+            if before.is_some() {
+                return Err(Failure::conflict(format!(
+                    "Add target already exists: {name}"
+                )));
+            }
+            if args.expected_sha256.contains_key(name) {
+                return Err(Failure::invalid("New file must not have expected_sha256"));
+            }
+        } else {
+            let b = before.as_deref().ok_or_else(|| {
+                Failure::new(
+                    Code::NotFound,
+                    format!("Patch source not found: {name}"),
+                    "Read the source before preparing a patch.",
+                )
+            })?;
+            changes::verify(
+                args.expected_sha256.get(name).ok_or_else(|| {
+                    Failure::invalid(format!("Missing expected_sha256 for {name}"))
+                })?,
+                b,
             )?;
-        } else if hashes.contains_key(name) {
-            bail!("New file must not have an expected_sha256");
         }
         match kind {
-            "add" => {
-                ensure!(before.is_none(), "Add target already exists: {name}");
+            Kind::Add => {
                 let mut text = String::new();
-                while i + 1 < lines.len() && !lines[i].starts_with("*** ") {
+                while i + 1 < patch.len() && !patch[i].starts_with("*** ") {
                     text.push_str(
-                        lines[i]
+                        patch[i]
                             .strip_prefix('+')
-                            .context("Added lines must begin with +")?,
+                            .ok_or_else(|| Failure::invalid("Added lines must begin with +"))?,
                     );
                     text.push('\n');
                     i += 1;
@@ -99,93 +157,139 @@ pub fn apply_with_policy(
                     after: Some(text.into_bytes()),
                 });
             }
-            "delete" => {
-                ensure!(before.is_some(), "Delete target not found: {name}");
-                changes.push(Change {
-                    path,
-                    before,
-                    after: None,
-                });
-            }
-            _ => {
-                let original =
-                    std::str::from_utf8(before.as_deref().context("Update target not found")?)
-                        .context("Patch requires UTF-8")?;
-                let crlf = original.contains("\r\n");
+            Kind::Delete => changes.push(Change {
+                path,
+                before,
+                after: None,
+            }),
+            Kind::Update => {
+                let original = changes::text(before.as_deref().expect("validated source"))?;
+                let (original, bom) = if let Some(s) = original.strip_prefix('\u{feff}') {
+                    (s, true)
+                } else {
+                    (original, false)
+                };
                 let trailing = original.ends_with('\n');
-                let mut content: Vec<String> = original.lines().map(String::from).collect();
-                let mut destination = None;
-                if let Some(move_to) = lines.get(i).and_then(|l| l.strip_prefix("*** Move to: ")) {
-                    let to = target(cwd, move_to)?;
-                    if let Some(policy) = policy {
-                        policy.check(&to)?;
-                    }
-                    ensure!(
-                        seen.insert(path_key(&to)) && bytes(&to)?.is_none(),
-                        "Move target already exists or is duplicated"
-                    );
-                    destination = Some(to);
+                let mut content = lines(original);
+                let default_ending = content
+                    .iter()
+                    .find(|l| !l.ending.is_empty())
+                    .map(|l| l.ending)
+                    .unwrap_or("\n");
+                let destination = if let Some(name) =
+                    patch.get(i).and_then(|l| l.strip_prefix("*** Move to: "))
+                {
                     i += 1;
-                }
+                    let p = target(cwd, name, policy)?;
+                    if !seen.insert(key(&p)) || changes::bytes(&p)?.is_some() {
+                        return Err(Failure::conflict("Move target exists or is duplicated"));
+                    }
+                    Some(p)
+                } else {
+                    None
+                };
                 let mut cursor = 0;
                 let mut hunks = 0;
-                while i + 1 < lines.len() && lines[i].starts_with("@@") {
+                while i + 1 < patch.len() && patch[i].starts_with("@@") {
                     hunks += 1;
                     i += 1;
-                    let mut old = Vec::new();
-                    let mut new = Vec::new();
-                    while i + 1 < lines.len()
-                        && !lines[i].starts_with("@@")
-                        && !lines[i].starts_with("*** ")
+                    let mut old: Vec<&str> = Vec::new();
+                    let mut new: Vec<(&str, Option<usize>)> = Vec::new();
+                    let mut removed = VecDeque::new();
+                    while i + 1 < patch.len()
+                        && !patch[i].starts_with("@@")
+                        && !patch[i].starts_with("*** ")
                     {
-                        let line = lines[i];
+                        let line = patch[i];
                         i += 1;
                         let (prefix, text) = line
                             .split_at_checked(1)
-                            .context("Patch lines require a prefix")?;
+                            .ok_or_else(|| Failure::invalid("Patch lines require a prefix"))?;
                         match prefix {
                             " " => {
-                                old.push(text.to_string());
-                                new.push(text.to_string());
+                                removed.clear();
+                                new.push((text, Some(old.len())));
+                                old.push(text);
                             }
-                            "-" => old.push(text.to_string()),
-                            "+" => new.push(text.to_string()),
-                            _ => bail!("Hunk lines require space, + or -"),
+                            "-" => {
+                                removed.push_back(old.len());
+                                old.push(text);
+                            }
+                            "+" => new.push((
+                                text,
+                                removed.pop_front().or_else(|| old.len().checked_sub(1)),
+                            )),
+                            _ => return Err(Failure::invalid("Hunk lines require space, + or -")),
                         }
                     }
-                    let eof = lines.get(i) == Some(&"*** End of File");
+                    let eof = patch.get(i) == Some(&"*** End of File");
                     if eof {
                         i += 1;
                     }
-                    ensure!(
-                        !old.is_empty(),
-                        "Update hunks require context or removed lines; use Add for a new file"
-                    );
-                    let matches: Vec<usize> = content
+                    if old.is_empty() {
+                        return Err(Failure::invalid(
+                            "Update requires nonempty context; use Write to replace an empty file",
+                        ));
+                    }
+                    let found = content
                         .windows(old.len())
                         .enumerate()
-                        .filter(|(pos, window)| {
+                        .filter(|(pos, w)| {
                             *pos >= cursor
-                                && *window == old.as_slice()
-                                && (!eof || *pos + old.len() == content.len())
+                                && w.iter().map(|l| l.body.as_str()).eq(old.iter().copied())
+                                && (!eof || pos + old.len() == content.len())
                         })
-                        .map(|(pos, _)| pos)
-                        .collect();
-                    ensure!(
-                        matches.len() == 1,
-                        "Hunk context is missing or ambiguous in {name}; read again and include unique context"
-                    );
-                    let pos = matches[0];
-                    let new_len = new.len();
-                    content.splice(pos..pos + old.len(), new);
-                    cursor = pos + new_len;
+                        .map(|(p, _)| p)
+                        .collect::<Vec<_>>();
+                    if found.is_empty() {
+                        return Err(Failure::conflict(format!(
+                            "Patch context missing in {name}"
+                        )));
+                    }
+                    if found.len() != 1 {
+                        return Err(Failure::new(
+                            Code::AmbiguousMatch,
+                            format!("Patch context matches {} times in {name}", found.len()),
+                            "Read again and provide unique context or an explicit End of File marker.",
+                        ));
+                    }
+                    let pos = found[0];
+                    let ending = content[pos..pos + old.len()]
+                        .iter()
+                        .find(|l| !l.ending.is_empty())
+                        .map(|l| l.ending)
+                        .unwrap_or(default_ending);
+                    let updated = new
+                        .iter()
+                        .map(|(body, source)| Line {
+                            body: (*body).into(),
+                            ending: source
+                                .map(|n| content[pos + n].ending)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(ending),
+                        })
+                        .collect::<Vec<_>>();
+                    cursor = pos + updated.len();
+                    content.splice(pos..pos + old.len(), updated);
                 }
-                ensure!(hunks > 0, "Update requires at least one @@ hunk");
-                let sep = if crlf { "\r\n" } else { "\n" };
-                let mut updated = content.join(sep);
-                if trailing {
-                    updated.push_str(sep);
+                if hunks == 0 && destination.is_none() {
+                    return Err(Failure::invalid(
+                        "Update requires an @@ hunk or a move destination",
+                    ));
                 }
+                if !trailing && let Some(last) = content.last_mut() {
+                    last.ending = "";
+                }
+                let mut updated = if bom {
+                    "\u{feff}".to_owned()
+                } else {
+                    String::new()
+                };
+                for line in content {
+                    updated.push_str(&line.body);
+                    updated.push_str(line.ending);
+                }
+                let after = Some(updated.into_bytes());
                 if let Some(to) = destination {
                     changes.push(Change {
                         path,
@@ -195,38 +299,41 @@ pub fn apply_with_policy(
                     changes.push(Change {
                         path: to,
                         before: None,
-                        after: Some(updated.into_bytes()),
+                        after,
                     });
                 } else {
                     changes.push(Change {
                         path,
                         before,
-                        after: Some(updated.into_bytes()),
+                        after,
                     });
                 }
             }
         }
+        if changes.len() > 100
+            || changes
+                .iter()
+                .map(|c| {
+                    c.before.as_ref().map_or(0, Vec::len) + c.after.as_ref().map_or(0, Vec::len)
+                })
+                .sum::<usize>()
+                > 64 * 1024 * 1024
+        {
+            return Err(Failure::invalid("Patch exceeds 100 changes or 64 MiB"));
+        }
     }
-    ensure!(!changes.is_empty(), "Empty patch");
-    // Write destinations before deleting move sources, reducing damage from interruption.
-    changes.sort_by_key(|change| change.after.is_none());
-    Ok(crate::changes::execute(&changes, args.preview)?)
-}
-
-fn path_key(path: &Path) -> String {
-    let key = path.to_string_lossy().into_owned();
-    if cfg!(windows) {
-        key.to_lowercase()
-    } else {
-        key
+    if changes.is_empty() {
+        return Err(Failure::invalid("Empty patch"));
     }
+    changes.sort_by_key(|c| c.after.is_none());
+    Ok(changes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
-    fn apply(cwd: &Path, v: &Value) -> Result<crate::changes::Receipt> {
+    fn apply(cwd: &Path, v: &Value) -> anyhow::Result<crate::changes::Receipt> {
         let mut v = v.clone();
         if v.get("expected_sha256").is_none() {
             let hashes = fs::read_dir(cwd)?
@@ -241,7 +348,12 @@ mod tests {
                 .collect::<serde_json::Map<_, _>>();
             v["expected_sha256"] = Value::Object(hashes);
         }
-        super::apply(cwd, &serde_json::from_value(v)?)
+        let args = serde_json::from_value(v)?;
+        let policy = crate::policy::Policy::unrestricted_for_test(cwd);
+        Ok(crate::changes::execute(
+            &super::plan(cwd, &args, &policy)?,
+            args.preview,
+        )?)
     }
     #[test]
     fn validates_every_file_before_writing_and_preserves_crlf() {
@@ -291,5 +403,21 @@ mod tests {
         )
         .unwrap();
         assert!(!d.path().join("b").exists());
+    }
+    #[test]
+    fn mixed_line_endings_bom_and_missing_final_newline_survive_contextual_edits() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "\u{feff}one\r\ntwo\nthree\r\nlast";
+        fs::write(d.path().join("a"), original).unwrap();
+        let patch =
+            "*** Begin Patch\n*** Update File: a\n@@\n one\n-two\n+TWO\n three\n*** End Patch";
+        let preview = apply(d.path(), &json!({"patch":patch,"preview":true})).unwrap();
+        assert!(preview.preview);
+        assert_eq!(fs::read_to_string(d.path().join("a")).unwrap(), original);
+        apply(d.path(), &json!({"patch":patch})).unwrap();
+        assert_eq!(
+            fs::read_to_string(d.path().join("a")).unwrap(),
+            "\u{feff}one\r\nTWO\nthree\r\nlast"
+        );
     }
 }

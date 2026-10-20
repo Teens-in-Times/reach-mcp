@@ -15,6 +15,10 @@ pub enum Code {
     CursorInvalid,
     Io,
     Internal,
+    ExecutionFailed,
+    Interrupted,
+    DurabilityLost,
+    OutputExpired,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
@@ -35,7 +39,7 @@ impl Failure {
         Self::new(
             Code::InvalidArguments,
             message,
-            "Correct arguments using Discover; no operation was submitted.",
+            "Correct arguments using Discover. If a task_id was returned, inspect that task before submitting different work.",
         )
     }
     pub fn conflict(message: impl Into<String>) -> Self {

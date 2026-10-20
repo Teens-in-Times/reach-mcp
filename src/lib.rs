@@ -10,10 +10,12 @@ pub mod files;
 pub mod http;
 pub mod image;
 pub mod jobs;
+pub mod journal;
 pub mod operation;
 pub mod patch;
 pub mod policy;
 pub mod process;
+pub mod results;
 pub mod terminal;
 pub mod terminal_output;
 #[cfg(windows)]

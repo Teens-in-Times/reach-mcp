@@ -29,7 +29,7 @@ fn setup() -> (tempfile::TempDir, engine::Hand) {
 #[tokio::test]
 async fn file_calls_generate_ids_and_retries_survive_recovery() {
     let (_root, hand) = setup();
-    let args = json!({"path":"sample.txt","content":"alpha\n","mode":"create"});
+    let args = json!({"path":"sample.txt","update":{"content":"alpha\n","mode":"create"}});
     let first = hand.execute("Write", args.clone()).await.unwrap();
     assert_eq!(first["status"], "completed");
     let mut retry = args;
@@ -104,17 +104,17 @@ async fn cancellation_owns_and_terminates_descendants() {
         .await
         .unwrap();
     let id = task["task_id"].clone();
+    let mut child_pid = None;
     for _ in 0..100 {
-        if pid_file.exists() {
+        child_pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if child_pid.is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let pid: u32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = child_pid.expect("Child PID was not fully published");
     let cancelled = hand.execute("Cancel", json!({"task_id":id})).await.unwrap();
     assert_eq!(cancelled["status"], "cancelled");
     let mut alive = true;
@@ -141,7 +141,7 @@ async fn cancellation_owns_and_terminates_descendants() {
 #[test]
 fn catalog_is_small_and_ids_are_not_required_for_mutations() {
     let tools = catalog::tools();
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 20);
     assert!(serde_json::to_vec(&tools).unwrap().len() < 35000);
     for tool in tools {
         if matches!(tool.name.as_ref(), "Write" | "Edit" | "Shell") {
@@ -185,8 +185,18 @@ async fn running_output_pages_and_stdin_do_not_rerun_the_command() {
     hand.execute("Input", json!({"task_id":id,"text":"hello\n","eof":true}))
         .await
         .unwrap();
-    let finished=hand.execute("Poll",json!({"task_id":id,"stdout_offset":first["output"]["stdout"]["next_offset"],"wait_seconds":10})).await.unwrap();
-    assert_eq!(finished["status"], "completed");
+    let confirmed = hand
+        .execute("Tasks", json!({"task_id":id,"wait_seconds":10}))
+        .await
+        .unwrap();
+    assert_eq!(confirmed["status"], "completed");
+    let finished = hand
+        .execute(
+            "Poll",
+            json!({"task_id":id,"stdout_offset":first["output"]["stdout"]["next_offset"]}),
+        )
+        .await
+        .unwrap();
     assert_eq!(finished["task_id"], id);
     assert!(
         finished["output"]["stdout"]["text"]

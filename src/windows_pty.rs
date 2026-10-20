@@ -34,6 +34,29 @@ struct Api {
 }
 static API: std::sync::LazyLock<std::result::Result<Api, String>> =
     std::sync::LazyLock::new(|| load_api().map_err(|e| e.to_string()));
+pub fn capabilities() -> crate::terminal::Backend {
+    match API.as_ref() {
+        Ok(api) => crate::terminal::Backend {
+            implementation: if api._library == 0 {
+                "windows_system_conpty"
+            } else {
+                "microsoft_redistributable_conpty"
+            }
+            .into(),
+            available: true,
+            alternate_screen: api._library != 0,
+            process_tree_owned_before_start: true,
+            error: None,
+        },
+        Err(e) => crate::terminal::Backend {
+            implementation: "windows_conpty".into(),
+            available: false,
+            alternate_screen: false,
+            process_tree_owned_before_start: true,
+            error: Some(e.clone()),
+        },
+    }
+}
 fn load_api() -> Result<Api> {
     use windows_sys::Win32::System::LibraryLoader::*;
     let path = std::env::current_exe()?

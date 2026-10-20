@@ -1,108 +1,113 @@
 # Reach
 
-项目仓库：[Teens-in-Times/reach-mcp](https://github.com/Teens-in-Times/reach-mcp)。
+[Teens-in-Times/reach-mcp](https://github.com/Teens-in-Times/reach-mcp)
 
-让通用 agent 操作本机的独立 Rust MCP 服务。文件、补丁、命令、进程输入与图片直接执行，不经过第二个 agent，也不依赖 Python、Node.js 或其他执行器。
+通用 Agent 的远程手：独立 Rust MCP 服务，直接提供文件、补丁、一次性命令、持久终端与图片能力。不经过第二个 Agent，也没有 Python/Node 运行时胶水层。调用批准由 MCP 客户端负责；Reach 检查鉴权、权限、参数和资源归属后执行。
 
-一个二进制，两个可选工具呈现方式，一段文本钥匙，一个本机管理页。管理页和 MCP 的权限分开；工具调用是否经过人工批准，由使用它的 MCP 客户端决定。Reach 收到通过鉴权、权限与参数检查的调用后直接执行。
+v0.3 是破坏性重构，不兼容 v0.2 的调用签名和任务记录。使用新的私有状态目录，保留旧实例供已有会话使用。
 
-## 启动
+## Windows 启动
 
-Windows x86_64 / MSVC、Rust 1.99.0 验证。源码使用官方 Rust MCP SDK `rmcp`，依赖锁定在 Cargo.lock。
+Windows x86_64 / MSVC、Rust 1.99 验证。下载便携包时应保留 reach.exe、conpty.dll 和 x64/OpenConsole.exe 的相对位置。完整终端使用固定版本、经过微软签名验证的 ConPTY。源码构建：
 
 ```powershell
 cargo build --release --locked
-# --directory 必须是一个尚不存在的私有目录
-.\target\release\reach.exe init --directory D:\Reach\private --cwd G:\Project
-.\target\release\reach.exe --config D:\Reach\private\config.json serve --background
-.\target\release\reach.exe --config D:\Reach\private\config.json ui
+./scripts/prepare-windows-runtime.ps1 -Destination ./target/release
+# directory 必须是一个新的私有目录
+./target/release/reach.exe init --directory D:\Reach\private --cwd G:\Project
+./target/release/reach.exe --config D:\Reach\private\config.json serve --background
+./target/release/reach.exe --config D:\Reach\private\config.json ui
 ```
 
-`init` 创建受当前用户和 SYSTEM ACL 保护的配置、密钥哈希库及状态目录。默认 MCP 地址为 `http://127.0.0.1:42373/mcp`；本机管理页在独立的 `127.0.0.1:42374` 上。`init --no-admin` 禁用管理页，CLI 发钥匙仍可使用。服务只绑定回环地址。
+实际 cargo target_directory 如被覆盖，以 cargo metadata 为准。打包脚本 scripts/build-windows-release.ps1 接受一个新的 Destination，构建便携 ZIP 和校验文件。ConPTY 来源、版本和许可证见 THIRD_PARTY_NOTICES.md。
 
-`ui` 由本机用户生成 3 分钟、单次使用的登录票据并打开浏览器。票据只经 URL fragment 交给页面，页面立即移除 fragment；登录后使用 HttpOnly、SameSite=Strict 的 Cookie 和独立 CSRF 校验。管理会话最多 8 小时、闲置 30 分钟失效。管理端口不会随 MCP 的 SSH 转发开放。它不依赖网站账号、云服务或网页登录密码。
+默认 MCP 为 http://127.0.0.1:42373/mcp，管理页为独立的 127.0.0.1:42374。只监听回环地址；init --no-admin 禁用管理页。
 
-## 文本钥匙：复制一次即可
-
-可在管理页添加客户端，或用 CLI：
+## 文本密钥与管理页
 
 ```powershell
-reach --config D:\Reach\private\config.json token issue `
-  --principal coding-agent --label "代码助手" --profile compact `
-  --scopes read,write,exec,tasks --root G:\Project --ttl-hours 2160 `
-  --token-file D:\Reach\private\coding-agent.token
+reach --config D:\Reach\private\config.json token issue --principal coding-agent --label "代码助手" --profile compact --scopes read,write,exec,tasks --root G:\Project --ttl-hours 2160 --token-file D:\Reach\private\coding-agent.token
 reach --config D:\Reach\private\config.json token list
 reach --config D:\Reach\private\config.json token revoke <credential-id>
 ```
 
-密钥形如 `reach_<id>.<secret>`，secret 来自操作系统的 32 字节密码学随机数。服务端只保存 SHA-256。支持标签、过期、轮换、撤销、权限和工作目录；每个请求都重新读取密钥库，无需重启生效。相同 principal 的钥匙共享任务归属，换 principal 即分开。密钥 ID 在 Authorization 文本内部，模型调用不需要再传客户端或会话 ID。
-
-标准请求头足以连接，不要求 agent 实现 HMAC 请求签名：
+密钥形如 reach_<id>.<secret>，秘密部分来自 OS 的 32 字节随机数；服务端仅保存 SHA-256。支持权限、工作目录、过期、撤销和轮换，每次请求重新检查。相同 principal 共享任务与终端归属；不同 principal 相互不可见。真实密钥放在客户端的私有配置中，不传入模型参数。
 
 ```json
-{
-  "mcpServers": {
-    "reach": {
-      "type": "http",
-      "url": "http://127.0.0.1:42373/mcp",
-      "headers": {"Authorization": "Bearer reach_REPLACE_WITH_YOUR_KEY"}
-    }
-  }
-}
+{"mcpServers":{"reach":{"type":"http","url":"http://127.0.0.1:42373/mcp","headers":{"Authorization":"Bearer reach_REPLACE_WITH_YOUR_KEY"}}}}
 ```
 
-这是常见客户端的配置示例；具体配置字段依客户端而异。协议层始终使用标准 Authorization header。密钥只给 MCP host，不进入模型的工具参数。不要将真实钥匙提交到 Git、放进提示词或截图。
+具体配置字段依客户端而异，协议采用 Authorization: Bearer。私有远程连接通过可选 SSH 回环反向转发加密，不修改 VPN、路由或 DNS。此鉴权不是 OAuth；公网部署需要另行配置 TLS/OAuth 网关。
 
-本方案是私有连接上的共享秘密鉴权，不是 AES 加密，也不伪装成 OAuth。现有远程场景通过 SSH 加密、回环转发；若另行部署给公网、多用户使用，应配合合适的 TLS/OAuth 网关，而不是直接暴露明文 HTTP 端口。
+init 保护私有目录的当前用户/SYSTEM ACL。ui 生成三分钟单次登录票据，页面移除 URL fragment 后兑换 HttpOnly/SameSite=Strict Cookie；管理变更校验 CSRF 与来源。会话最多八小时、闲置三十分钟失效。MCP 密钥不能登录管理页，管理端口不会被自动转发。
 
-## 精简模式与原生模式
-
-默认 **compact**：只注册 `Run` 和 `Discover` 两个小定义。初始化 `instructions` 提供当前主机、默认目录、授权操作签名、重试与任务规则。详细 schema 留在服务端，需要时只查询一个：
-
-```json
-{"name":"Run","arguments":{"tool":"Read","arguments":{"paths":["src/main.rs"]}}}
-{"name":"Discover","arguments":{"tool":"ApplyPatch"}}
-```
-
-**native**：公开被授权的独立工具，便于客户端做逐工具展示与审批。两种模式共用操作实现、权限和服务端参数校验；精简模式不会让任意参数绕过检查。
-
-模型上下文如何组织、客户端是否使用初始化说明、每轮模型请求是否附带工具定义，以及模型厂商是否缓存前缀，都是 host 的行为，Reach 无法保证只注入一次。它能保证精简模式不再通过 tools/list 注册全套操作 schema；忽略初始化说明的 host 可通过 Discover 补查。相关约束见 [设计说明](docs/architecture.md)。
-
-## 工具
+## 工具与上下文
 
 | 操作 | 能力 |
 |---|---|
-| Read / Glob / Grep | 批量 UTF-8 与目录读取、文件和内容搜索、忽略规则、行号与分页 |
-| Write / Edit | 原子单文件写入与精确替换，可用 SHA-256 拒绝过时编辑 |
-| ApplyPatch | 熟悉的 Begin Patch 格式；多文件新增、更新、删除、移动；先验证全部文件、保留 CRLF |
-| Shell | 独立命令任务、cwd、期限、异步返回及进程树生命周期 |
-| Poll / Input / Cancel | 分页读取运行中的 stdout/stderr、写入管道 stdin、停止所属命令树 |
-| Tasks | 查找自己的近期任务与丢失的结果，断连后恢复，不重跑命令 |
-| Image | 原生 MCP 图片内容，PNG/JPEG/GIF/WebP，最多 8 MiB |
-| Info | 主机、默认工作目录、身份、工具模式与有效权限 |
+| Read / Glob / Grep | 批量 UTF-8、目录、搜索、忽略规则、行号和有界分页 |
+| Write / Edit | 明确的创建、覆盖、追加、精确替换；版本保护及预览 |
+| ApplyPatch / Recover | 多文件补丁、逐文件提交/回滚报告、持久原始内容与显式恢复 |
+| Shell / Poll / Input / Cancel | 一次性命令、分开的 stdout/stderr、期限、输入、取消进程树 |
+| Tasks | 找回任务结果、等待最终状态，断连不重跑 |
+| TerminalOpen / Read / Input / Resize / Close | 真正的 PTY、持久 Shell、交互、全屏 TUI、屏幕快照和增量原始流 |
+| Terminals | 找回自己的终端会话及生命周期状态 |
+| Image / Info | 原生 MCP 图片；主机、身份、权限和实际终端后端能力 |
 
-每次调用可覆盖绝对 cwd，默认为钥匙的首个授权目录；没有跨请求全局 chdir。新写入/命令自动产生 task_id，可选 operation_id 只用于明确的相同操作重试。多个 agent 可共用执行器；不同钥匙的任务列表、查询、重试、输入与取消都按 principal 检查。
+默认 compact 仅注册 Run 和 Discover。初始化 instructions 从 Rust 参数类型及 Schema 自动生成操作签名与使用规则；详细 Schema 通过 Discover 查询单项。native 暴露被授权的独立工具，便于逐工具审批。两者共用同一类型化执行核心。
 
-`Shell.wait_seconds` 只控制本次等结果多久，`timeout_seconds` 控制进程期限。`keep_stdin=true` 开放 Input 管道；这不是 PTY，也不提供持续的交互 shell。Poll 的 offset 是字节位置，按返回的 next_offset 续读。任务结果与日志在 state_dir 持久保留；每个流最多存 16 MiB、内联页最多 12 KB。执行器重启后，未完成任务标为 interrupted，不自动重放。
+```json
+{"name":"Run","arguments":{"tool":"Read","arguments":{"paths":["src/main.rs"]}}}
+{"name":"Discover","arguments":{"tool":"Write"}}
+```
 
-文件工具限制在钥匙的工作目录内，并排除执行器的私有配置、状态、凭据等保护路径。**exec 是当前系统用户的完整命令执行权限**，不能靠 cwd 或工作目录将它变成系统沙箱。对不可信代码/用户需要 OS 用户、容器或虚拟机隔离。
+Reach 无法控制 host 是否采用初始化说明、每轮如何注入工具或模型供应商的缓存。compact 减少注册 Schema，也失去模型 API 层逐项参数约束；服务端仍校验类型和权限，Run 的注解保持保守。
 
-Write/Edit 是单文件原子替换；ApplyPatch 会先验证所有文件并在普通提交错误时尝试回滚，但多文件修改不是崩溃原子事务，也不能阻止外部进程同时写文件。它不承诺终端、图片理解或原生 agent 私有 API 的完全等价实现。
+## 文件、版本与恢复
 
-## 私有远程连接
+Write 的 update 是带标签的结构，不存在隐式覆盖：
 
-按 config.example.json 配置可选 ssh 项。原生 SSH 子进程监督回环反向转发，连接失败后重试，不更改 VPN、路由、防火墙或 DNS。只转发 MCP 端口。远端客户端使用目标机的 `127.0.0.1:<remote_port>/mcp`；本机客户端使用本机 MCP 地址。SSH 密钥和已知主机校验沿用现有 OpenSSH 配置，不另存 SSH 密码。
+```json
+{"path":"new.txt","update":{"mode":"create","content":"hello\n"}}
+{"path":"existing.txt","update":{"mode":"replace","content":"new\n","expected_sha256":"HASH_FROM_READ"}}
+{"path":"existing.txt","update":{"mode":"append","content":"more\n","expected_sha256":"HASH_FROM_READ"}}
+```
 
-## 开发与验证
+Edit 与补丁修改已有文件也必须带当前 SHA-256。Write、Edit、ApplyPatch 支持 preview:true，返回摘要和有界 diff，不写文件。支持 UTF-8/BOM、CRLF、混合换行及没有最终换行符的文本；UTF-16/二进制修改明确拒绝。
+
+Windows 提交持有排他句柄，在同一句柄上核验版本、写入和回滚，普通外部写入及重命名会被拒绝。**不承诺单文件或多文件崩溃原子性**。提交前原始内容会刷盘到私有状态目录。失败逐文件报告 applied、rolled_back、rollback_failed 或未尝试状态；父目录创建不回滚。
+
+Recover(source_task_id) 检查已结束任务的原始、计划与当前版本。恢复须显式提供每个路径的当前版本，并作为新任务执行；再次变化会冲突，不自动覆盖外部编辑。执行器重启不会自动回滚或重放。恢复数据遵循私有状态的保留期限，不能替代长期备份。
+
+## 命令与终端
+
+Shell 每次启动新进程，cwd 不跨调用保留；wait_seconds 控制响应等待，timeout_seconds 控制进程期限。keep_stdin:true 提供管道输入，和终端模型分开。Windows 用户命令在进程树归属建立后才获准开始。
+
+Poll 在有新字节或任务结束时返回；Tasks 等待最终任务状态。stdout_next_offset/stderr_next_offset 可接在初始预览之后，随后按每页 next_offset 续读；encoding:base64 无损读取原始字节，文本模式报告无效 UTF-8。
+
+TerminalOpen 自动分配 terminal_id，Shell 的 cwd、环境及交互状态持续存在。TerminalInput 支持文本、控制键与 VT 序列，TerminalResize 更改实际 PTY 尺寸。TerminalRead 默认返回解析后的屏幕，since_screen 抑制重复画面；expected_screen 可保证分页版本一致。view:stream/both 返回 base64 字节流和字节游标，溢出有明确 gap。终端退出只依据 OS 进程状态，不猜提示符。PTY 输出为混合流，不能再拆成 stdout/stderr。
+
+HTTP 断开不取消已接受的任务或终端。新调用可省略 operation_id；若要在丢失提交响应后安全重试，应在首次调用就指定 ID。没有重试 ID 的丢失提交必须先查 Tasks/Terminals，不能声称恰好执行一次。终端 input_id 对语义输入去重；written 表示写入 OS 通道，不表示应用已处理。重启后的终端标记 interrupted，输出明确过期，不会重建会话。
+
+## 容量与权限边界
+
+默认四个任务并发执行，活跃/排队共三十二项、每个 principal 八项。结束任务结果最多保留一百二十八项，结束任务日志合计 256 MiB、恢复数据合计 256 MiB、最长七天；活跃任务的输出/恢复空间另受四个 worker 和各项大小上限约束。每流最多存 16 MiB，每页最多 12 KB。到期保留重试身份，达到一万个身份时拒绝新增，而不悄悄允许旧 ID 重跑。
+
+终端最多八个活跃会话、每个 principal 四个，闲置三十分钟关闭；每会话原始输出环 1 MiB，结束后缓存最多六十四个、最长一小时。输入队列三十二项，每次最多 8 KiB；队列满明确拒绝，部分投递不确定时不会建议盲重发。
+
+文件工具执行工作目录和私有路径检查。exec 是当前 OS 用户的完整执行能力，cwd、任务归属和凭据身份不是系统沙箱。对不可信代码/用户使用 OS 用户、容器或 VM 隔离。审计只记录身份、操作和结果元数据；输出及恢复内容仍可能含用户数据。
+
+## 开发和验收
 
 ```powershell
+./scripts/prepare-windows-runtime.ps1 -Destination ./target/debug/deps
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-测试包含协议级身份传递、只读绕过、工作目录与私有文件保护、任务归属、撤销/过期、管理 Cookie/CSRF/票据重放、补丁失败无提前写入、CRLF、运行中输出、stdin、期限、取消及重启恢复。管理页为嵌入式 HTML/CSS/JavaScript，无前端构建或运行时依赖。
+scripts/test-service-recovery.cjs 是开发用的真实 HTTP/进程故障测试客户端，不是服务端运行依赖。它需要新建的隔离目录，验证强制终止服务、PTY 后代清理、重启不重放和持久文件恢复。文件提交中途崩溃由 Rust 父测试启动独立子测试并强杀验证。
 
-目前验证目标为 Windows。非 Windows 构建路径尚未验证；不要据此假定拥有与 Windows Job Objects 等价的子进程树隔离。审计记录仅含身份、操作与结果元数据；任务输出可能含用户数据，私有状态目录应持续受权限保护。
+[架构说明](docs/architecture.md) · [验收记录](docs/refactor-v0.3.md)
 
-本仓库是用户的独立 Reach 项目，未发布到公开包注册表，与其他同名工具无关联。MIT；依赖保留各自许可证。
+Windows 是已验证目标。非 Windows 路径不保证具有相同的强制锁定或进程树清理语义。MIT；依赖与微软运行库保留各自许可证。

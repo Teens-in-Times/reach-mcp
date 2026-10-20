@@ -404,7 +404,7 @@ async fn cancel(State(admin): State<Admin>, Path(id): Path<String>) -> ApiResult
         )
     })?;
     audit(&admin, "task.cancel", &id.to_string());
-    Ok(Json(admin.hand.jobs.report(&task, 0).await))
+    Ok(Json(json!(admin.hand.jobs.report(&task, 0).await)))
 }
 async fn logout(State(admin): State<Admin>, headers: HeaderMap) -> Response {
     if let Some(token) = cookie(&headers) {

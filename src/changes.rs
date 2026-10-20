@@ -19,6 +19,47 @@ pub struct Change {
     pub before: Option<Vec<u8>>,
     pub after: Option<Vec<u8>>,
 }
+pub fn validate(changes: &[Change]) -> Result<()> {
+    if changes.is_empty()
+        || changes.len() > 100
+        || changes
+            .iter()
+            .map(|c| c.path.as_os_str().len())
+            .sum::<usize>()
+            > 32000
+        || changes
+            .iter()
+            .map(|c| c.before.as_ref().map_or(0, Vec::len) + c.after.as_ref().map_or(0, Vec::len))
+            .sum::<usize>()
+            > 64 * 1024 * 1024
+    {
+        return Err(Failure::invalid(
+            "Change set exceeds 100 files, 32 KiB of paths, or 64 MiB of contents",
+        ));
+    }
+    for c in changes {
+        if !c.path.is_absolute() {
+            return Err(Failure::invalid(
+                "Change targets must be absolute local paths",
+            ));
+        }
+        if fs::symlink_metadata(&c.path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Failure::new(
+                Code::PermissionDenied,
+                "Mutation target is a symbolic link",
+                "Use its explicit workspace target path; link deletion/replacement requires an explicit filesystem command.",
+            ));
+        }
+        if c.before.as_ref().is_some_and(|b| b.len() > MAX_FILE)
+            || c.after.as_ref().is_some_and(|b| b.len() > MAX_FILE)
+        {
+            return Err(Failure::invalid("File exceeds 16 MiB"));
+        }
+        text(c.before.as_deref().unwrap_or_default())?;
+        text(c.after.as_deref().unwrap_or_default())?;
+    }
+    Ok(())
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
@@ -270,19 +311,18 @@ impl Drop for Locked {
 pub fn execute(changes: &[Change], preview: bool) -> Result<Receipt> {
     execute_with(changes, preview, |_| Ok(()))
 }
-fn execute_with(
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Point {
+    Apply(usize),
+    AfterApply(usize),
+    Rollback(usize),
+}
+pub(crate) fn execute_with(
     changes: &[Change],
     preview: bool,
-    mut before_write: impl FnMut(usize) -> Result<()>,
+    mut before_write: impl FnMut(Point) -> Result<()>,
 ) -> Result<Receipt> {
-    if changes
-        .iter()
-        .map(|c| c.before.as_ref().map_or(0, Vec::len) + c.after.as_ref().map_or(0, Vec::len))
-        .sum::<usize>()
-        > 64 * 1024 * 1024
-    {
-        return Err(Failure::invalid("Change set exceeds 64 MiB"));
-    }
+    validate(changes)?;
     let mut receipt = Receipt {
         preview,
         success: true,
@@ -290,6 +330,18 @@ fn execute_with(
         files: changes.iter().map(Change::receipt).collect::<Result<_>>()?,
         error: None,
     };
+    let mut diff_budget = 32000usize;
+    for file in &mut receipt.files {
+        if file.diff.len() > diff_budget {
+            let mut end = diff_budget;
+            while !file.diff.is_char_boundary(end) {
+                end -= 1;
+            }
+            file.diff.truncate(end);
+            file.diff_truncated = true;
+        }
+        diff_budget = diff_budget.saturating_sub(file.diff.len());
+    }
     if preview {
         return Ok(receipt);
     }
@@ -316,20 +368,23 @@ fn execute_with(
         }
     }
     for (i, c) in changes.iter().enumerate() {
-        let result = before_write(i).and_then(|()| match &c.after {
-            Some(b) => locked[i].store(b),
-            None => locked[i].delete(),
-        });
+        let result = before_write(Point::Apply(i))
+            .and_then(|()| match &c.after {
+                Some(b) => locked[i].store(b),
+                None => locked[i].delete(),
+            })
+            .and_then(|()| before_write(Point::AfterApply(i)));
         if let Err(e) = result {
             receipt.success = false;
             receipt.error = Some(e.clone());
             receipt.files[i].error = Some(e);
             // The failing write may already have changed bytes: roll it back too.
             for j in (0..=i).rev() {
-                let result = match &changes[j].before {
-                    Some(b) => locked[j].undelete().and_then(|()| locked[j].store(b)),
-                    None => locked[j].delete(),
-                };
+                let result =
+                    before_write(Point::Rollback(j)).and_then(|()| match &changes[j].before {
+                        Some(b) => locked[j].undelete().and_then(|()| locked[j].store(b)),
+                        None => locked[j].delete(),
+                    });
                 receipt.files[j].outcome = match result {
                     Ok(()) => Outcome::RolledBack,
                     Err(e) => {
@@ -383,7 +438,7 @@ mod tests {
         assert!(!b.exists());
         fs::write(&a, b"old").unwrap();
         let report = execute_with(&changes, false, |i| {
-            if i == 1 {
+            if i == Point::Apply(1) {
                 Err(Failure::new(Code::Io, "injected disk failure", "inspect"))
             } else {
                 Ok(())
@@ -395,5 +450,94 @@ mod tests {
         assert_eq!(report.files[1].outcome, Outcome::RolledBack);
         assert_eq!(fs::read(&a).unwrap(), b"old");
         assert!(!b.exists());
+    }
+    #[test]
+    fn failed_rollback_is_reported_per_file_and_does_not_claim_restoration() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        fs::write(&a, b"old-a").unwrap();
+        fs::write(&b, b"old-b").unwrap();
+        let changes = vec![
+            Change {
+                path: a.clone(),
+                before: Some(b"old-a".to_vec()),
+                after: Some(b"new-a".to_vec()),
+            },
+            Change {
+                path: b.clone(),
+                before: Some(b"old-b".to_vec()),
+                after: Some(b"new-b".to_vec()),
+            },
+        ];
+        let r = execute_with(&changes, false, |point| {
+            if matches!(point, Point::Apply(1) | Point::Rollback(0)) {
+                Err(Failure::new(
+                    Code::Io,
+                    "injected storage failure",
+                    "inspect recovery data",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert!(!r.success);
+        assert_eq!(r.files[0].outcome, Outcome::RollbackFailed);
+        assert_eq!(r.files[1].outcome, Outcome::RolledBack);
+        assert_eq!(fs::read(&a).unwrap(), b"new-a");
+        assert_eq!(fs::read(&b).unwrap(), b"old-b");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_commit_excludes_external_writes_and_rename_until_handles_close() {
+        use std::sync::mpsc;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a");
+        fs::write(&path, b"old").unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let target = path.clone();
+        let worker = std::thread::spawn(move || {
+            execute_with(
+                &[Change {
+                    path: target,
+                    before: Some(b"old".to_vec()),
+                    after: Some(b"new".to_vec()),
+                }],
+                false,
+                |point| {
+                    if point == Point::Apply(0) {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let external = fs::OpenOptions::new().write(true).open(&path);
+        let renamed = fs::rename(&path, d.path().join("renamed"));
+        release_tx.send(()).unwrap();
+        let r = worker.join().unwrap().unwrap();
+        assert!(external.is_err());
+        assert!(renamed.is_err());
+        assert!(r.success);
+        assert_eq!(fs::read(path).unwrap(), b"new");
+    }
+    #[test]
+    fn multi_file_diff_output_has_a_global_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let changes = (0..8)
+            .map(|i| Change {
+                path: d.path().join(i.to_string()),
+                before: None,
+                after: Some(("line\n".repeat(5000)).into_bytes()),
+            })
+            .collect::<Vec<_>>();
+        let r = execute(&changes, true).unwrap();
+        assert!(r.files.iter().map(|f| f.diff.len()).sum::<usize>() <= 32000);
+        assert!(r.files.iter().any(|f| f.diff_truncated));
+        assert!(fs::read_dir(d.path()).unwrap().next().is_none());
     }
 }

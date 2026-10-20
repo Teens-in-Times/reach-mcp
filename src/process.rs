@@ -1,9 +1,9 @@
+use crate::results::{CommandOutput, TaskOutput};
 use crate::{
     SshConfig,
-    jobs::{Jobs, State, Task},
+    jobs::{Completion, Jobs, StreamStats, Task},
 };
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -82,16 +82,19 @@ struct Capture {
     preview: Vec<u8>,
     total: u64,
     stored: u64,
-    path: PathBuf,
 }
 
-async fn capture(mut input: impl AsyncRead + Unpin, path: PathBuf) -> Result<Capture> {
+async fn capture(
+    mut input: impl AsyncRead + Unpin,
+    path: PathBuf,
+    task: Arc<Task>,
+    stream: usize,
+) -> Result<Capture> {
     let mut file = tokio::fs::File::create(&path).await?;
     let mut result = Capture {
         preview: Vec::new(),
         total: 0,
         stored: 0,
-        path,
     };
     let mut buffer = [0u8; 8192];
     loop {
@@ -110,6 +113,11 @@ async fn capture(mut input: impl AsyncRead + Unpin, path: PathBuf) -> Result<Cap
             file.flush().await?;
             result.stored += store as u64;
         }
+        task.streams.lock().expect("streams")[stream] = Some(StreamStats {
+            total: result.total,
+            stored: result.stored,
+        });
+        task.changed.notify_waiters();
     }
     file.flush().await?;
     Ok(result)
@@ -119,7 +127,7 @@ pub async fn shell(
     jobs: Arc<Jobs>,
     task: Arc<Task>,
     args: crate::operation::ShellArgs,
-) -> Result<(State, Value)> {
+) -> Result<Completion> {
     let (id, cwd) = {
         let record = task.record.lock().expect("task");
         (record.task_id, record.cwd.clone())
@@ -138,14 +146,14 @@ pub async fn shell(
             shell.arg("-NonInteractive");
         }
         shell.arg("-Command")
-            .arg(format!("$OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $OutputEncoding; {command}"));
+            .arg(format!("if ([Console]::ReadLine() -ne 'reach-start') {{ exit 125 }}; $OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $OutputEncoding; & {{ {command}\n }}"));
     } else {
         shell.arg("-c").arg(command);
     }
     hide(&mut shell);
     let mut child = shell
         .current_dir(cwd)
-        .stdin(if keep_stdin {
+        .stdin(if keep_stdin || cfg!(windows) {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -162,62 +170,136 @@ pub async fn shell(
         }
     };
     let pid = child.id();
-    *task.stdin.lock().await = child.stdin.take();
+    let mut stdin = child.stdin.take();
+    #[cfg(windows)]
+    {
+        // No user command can run before job ownership is established. If Reach
+        // dies before this handshake, EOF exits the shell without running it.
+        let input = stdin.as_mut().context("Missing command launch gate")?;
+        tokio::time::timeout(Duration::from_secs(5), input.write_all(b"reach-start\n"))
+            .await
+            .context("Command launch gate timed out")??;
+    }
+    if keep_stdin {
+        *task.stdin.lock().await = stdin.take();
+    }
+    drop(stdin);
     let (out_path, err_path) = jobs.logs(id);
-    let out = tokio::spawn(capture(child.stdout.take().context("stdout")?, out_path));
-    let err = tokio::spawn(capture(child.stderr.take().context("stderr")?, err_path));
+    let failure = CancellationToken::new();
+    let out_task = task.clone();
+    let out_failure = failure.clone();
+    let stdout = child.stdout.take().context("stdout")?;
+    let out = tokio::spawn(async move {
+        let result = capture(stdout, out_path, out_task, 0).await;
+        if result.is_err() {
+            out_failure.cancel();
+        }
+        result
+    });
+    let err_task = task.clone();
+    let err_failure = failure.clone();
+    let stderr = child.stderr.take().context("stderr")?;
+    let err = tokio::spawn(async move {
+        let result = capture(stderr, err_path, err_task, 1).await;
+        if result.is_err() {
+            err_failure.cancel();
+        }
+        result
+    });
     let (state, status) = tokio::select! {
-        status=child.wait()=> (State::Completed,status?),
+        status=child.wait()=> (Reason::Exit,status?),
+        _=failure.cancelled()=> {
+            task.stdin.lock().await.take();drop(owner);let _=child.kill().await;let status=child.wait().await?;return collect(Reason::Io,status.code(),pid,out,err).await;
+        },
         _=task.cancel.cancelled()=> {
             task.stdin.lock().await.take();
             drop(owner);
             let _=child.kill().await;
             let status=child.wait().await?;
-            return collect(State::Cancelled,status.code(),pid,out,err).await;
+            return collect(Reason::Cancelled,status.code(),pid,out,err).await;
         },
         _=tokio::time::sleep(Duration::from_secs(timeout))=> {
             task.stdin.lock().await.take();
             drop(owner);
             let _=child.kill().await;
             let status=child.wait().await?;
-            return collect(State::TimedOut,status.code(),pid,out,err).await;
+            return collect(Reason::Timeout,status.code(),pid,out,err).await;
         }
     };
     // Closing this task's job also closes any descendants still holding output pipes.
     task.stdin.lock().await.take();
     drop(owner);
-    collect(
-        if status.success() {
-            state
-        } else {
-            State::Failed
-        },
-        status.code(),
-        pid,
-        out,
-        err,
-    )
-    .await
+    collect(state, status.code(), pid, out, err).await
 }
 
+enum Reason {
+    Exit,
+    Cancelled,
+    Timeout,
+    Io,
+}
 async fn collect(
-    state: State,
+    reason: Reason,
     code: Option<i32>,
     pid: Option<u32>,
     out: tokio::task::JoinHandle<Result<Capture>>,
     err: tokio::task::JoinHandle<Result<Capture>>,
-) -> Result<(State, Value)> {
-    let out = out.await??;
-    let err = err.await??;
-    Ok((
-        state,
-        json!({"exit_code":code,"pid":pid,
-        "stdout":String::from_utf8_lossy(&out.preview),"stderr":String::from_utf8_lossy(&err.preview),
-        "stdout_bytes":out.total,"stderr_bytes":err.total,
-        "stdout_path":out.path,"stderr_path":err.path,
-        "output_truncated":out.total>out.preview.len() as u64 || err.total>err.preview.len() as u64,
-        "logs_truncated":out.total>out.stored || err.total>err.stored}),
-    ))
+) -> Result<Completion> {
+    // Join both drains even when one failed, so no detached capture task survives a result.
+    let (out, err) = tokio::join!(out, err);
+    let out = out??;
+    let err = err??;
+    fn preview(bytes: &[u8]) -> (String, u64, bool) {
+        let bytes = if let Err(e) = std::str::from_utf8(bytes)
+            && e.error_len().is_none()
+        {
+            &bytes[..e.valid_up_to()]
+        } else {
+            bytes
+        };
+        (
+            String::from_utf8_lossy(bytes).into_owned(),
+            bytes.len() as u64,
+            std::str::from_utf8(bytes).is_err(),
+        )
+    }
+    let (stdout, stdout_next_offset, stdout_encoding_errors) = preview(&out.preview);
+    let (stderr, stderr_next_offset, stderr_encoding_errors) = preview(&err.preview);
+    let output = CommandOutput {
+        exit_code: code,
+        pid,
+        stdout,
+        stderr,
+        stdout_next_offset,
+        stderr_next_offset,
+        stdout_bytes: out.total,
+        stderr_bytes: err.total,
+        stdout_stored: out.stored,
+        stderr_stored: err.stored,
+        stdout_encoding_errors,
+        stderr_encoding_errors,
+        output_truncated: out.total > out.preview.len() as u64
+            || err.total > err.preview.len() as u64,
+        logs_truncated: out.total > out.stored || err.total > err.stored,
+    };
+    Ok(match reason {
+        Reason::Cancelled => Completion::Cancelled {
+            result: Some(output),
+            not_started: false,
+        },
+        Reason::Timeout => Completion::TimedOut { result: output },
+        Reason::Exit if code == Some(0) => Completion::Completed {
+            result: TaskOutput::Command(output),
+        },
+        _ => Completion::Failed {
+            error: crate::error::Failure::new(
+                crate::error::Code::ExecutionFailed,
+                format!("Command exited with code {code:?}"),
+                "Inspect stdout/stderr before submitting different work.",
+            ),
+            result: Some(TaskOutput::Command(output)),
+        },
+    })
 }
 
 pub async fn tunnel(config: SshConfig, local_port: u16, stop: CancellationToken) {
