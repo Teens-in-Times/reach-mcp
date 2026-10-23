@@ -94,45 +94,31 @@ impl ServerHandler for Hand {
                 None,
             ));
         }
-        let outcome: anyhow::Result<(Value,String)>=async {
-   catalog::validate(&name,&arguments)?;
-   if p.profile==Profile::Compact && name=="Discover" {
-    let allowed:Vec<Tool>=catalog::tools().into_iter().filter(|t|p.allows(&t.name)).collect();
-    let value=if let Some(name)=arguments.get("tool").and_then(Value::as_str) {serde_json::to_value(allowed.into_iter().find(|t|t.name==name).ok_or_else(||anyhow::anyhow!("Unknown or unavailable operation"))?)?}
-     else {json!({"operations":allowed.iter().map(|t|json!({"name":t.name,"description":t.description})).collect::<Vec<_>>(),"guide":"See initialization instructions; Discover one tool only when exact schema is needed."})};
-    return Ok((value,"Discover".into()));
-   }
-   let (operation,args)=if p.profile==Profile::Compact {(crate::files::text_arg(&arguments,"tool")?.to_string(),arguments["arguments"].clone())}else{(name.clone(),arguments)};
-   Ok((self.execute_for(&p,&operation,args).await?,operation))
-  }.await;
-        let (mut value, operation, error) = match outcome {
-            Ok((value, operation)) => {
-                let error = !matches!(operation.as_str(), "Tasks" | "Poll" | "Cancel")
-                    && value
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| {
-                            matches!(
-                                s,
-                                "failed" | "timed_out" | "cancelled" | "interrupted" | "unknown"
-                            )
-                        });
-                (value, operation, error)
+        let mut audit_operation = name.clone();
+        let outcome:crate::error::Result<(Value,bool,Option<ContentBlock>)>=async {
+            if p.profile==Profile::Compact&&name=="Discover" {
+                let args:crate::operation::DiscoverArgs=serde_json::from_value(arguments.clone()).map_err(|e|crate::error::Failure::invalid(e.to_string()))?;
+                let allowed:Vec<Tool>=catalog::tools().into_iter().filter(|t|p.allows(&t.name)).collect();
+                let value=if let Some(name)=args.tool {allowed.into_iter().find(|t|t.name==name).map(|t|serde_json::to_value(t).expect("tool")).ok_or_else(||crate::error::Failure::invalid("Unknown or unavailable operation"))?}
+                    else{json!({"operations":allowed.iter().map(|t|json!({"name":t.name,"description":t.description})).collect::<Vec<_>>()})};
+                return Ok((value,false,None));
             }
-            Err(e) => (json!({"error":format!("{e:#}")}), name, true),
+            let (operation,args)=if p.profile==Profile::Compact {
+                let args:crate::operation::RunArgs=serde_json::from_value(arguments).map_err(|e|crate::error::Failure::invalid(e.to_string()))?;(args.tool,Value::Object(args.arguments))
+            }else{(name.clone(),arguments)};
+            audit_operation=operation.clone();let reply=self.execute_for(&p,&operation,args).await?;
+            let image=reply.image().map(|i|serde_json::from_value(json!({"type":"image","data":i.data,"mimeType":i.mime_type})).expect("native image block"));
+            Ok((serde_json::to_value(&reply).expect("typed reply"),reply.execution_failed(),image))
+        }.await;
+        let (value, error, image) = match outcome {
+            Ok(r) => r,
+            Err(error) => (json!({"kind":"rejected","error":error}), true, None),
         };
+        let operation = audit_operation;
         if let Err(e) = self.audit.record(&p, &operation, started, !error) {
             eprintln!("Audit write failed: {e}");
         }
-        let mut blocks = Vec::new();
-        if let Some(data) = value.as_object_mut().and_then(|v| v.remove("image_base64")) {
-            blocks.push(
-                serde_json::from_value(
-                    json!({"type":"image","data":data,"mimeType":value["mime_type"]}),
-                )
-                .map_err(|_| ErrorData::internal_error("Image encoding failed", None))?,
-            );
-        }
+        let mut blocks: Vec<ContentBlock> = image.into_iter().collect();
         blocks.insert(0, ContentBlock::text(value.to_string()));
         let mut result = CallToolResult::success(blocks);
         result.structured_content = Some(value);

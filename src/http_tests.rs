@@ -58,6 +58,7 @@ fn fixture(rate: u32) -> Fixture {
         audit: Arc::new(Audit::open(&config.state_dir).unwrap()),
         jobs: Arc::new(Jobs::open(&config.state_dir).unwrap()),
         config: Arc::new(config),
+        terminals: crate::terminal::Terminals::open(&root.path().join("state")).unwrap(),
     };
     Fixture {
         app: crate::http::router(hand, CancellationToken::new()),
@@ -135,7 +136,7 @@ async fn stateless_discovery_compact_dispatch_and_scope_enforcement() {
         .len();
     assert!(compact_bytes < 1400);
     let (_, native, _) = rpc(&f, Some(&f.b), "tools/list", json!({})).await;
-    assert_eq!(native["result"]["tools"].as_array().unwrap().len(), 13);
+    assert_eq!(native["result"]["tools"].as_array().unwrap().len(), 20);
     let info = tool(&f, &f.a, "Run", json!({"tool":"Info","arguments":{}})).await;
     assert_eq!(info["result"]["structuredContent"]["principal"], "a");
     let denied = tool(
@@ -172,7 +173,7 @@ async fn ownership_retry_rotation_and_revocation_use_authenticated_identity() {
         &f,
         &f.a,
         "Run",
-        json!({"tool":"Write","arguments":{"path":"sample","content":"hello"}}),
+        json!({"tool":"Write","arguments":{"path":"sample","update":{"content":"hello","mode":"create"}}}),
     )
     .await;
     let id = created["result"]["structuredContent"]["task_id"].clone();
@@ -185,7 +186,7 @@ async fn ownership_retry_rotation_and_revocation_use_authenticated_identity() {
         &f,
         &f.b,
         "Write",
-        json!({"path":"sample","content":"hello","operation_id":id}),
+        json!({"path":"sample","update":{"content":"hello","mode":"create"},"operation_id":id}),
     )
     .await;
     assert_eq!(retry["result"]["isError"], true);
@@ -264,4 +265,115 @@ async fn origin_host_rate_and_native_image_contract() {
     let f = fixture(1);
     assert_eq!(rpc(&f, Some(&f.a), "tools/list", json!({})).await.0, 200);
     assert_eq!(rpc(&f, Some(&f.a), "tools/list", json!({})).await.0, 429);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn terminal_ownership_is_enforced_over_both_mcp_profiles() {
+    let f = fixture(240);
+    let opened = tool(
+        &f,
+        &f.a,
+        "Run",
+        json!({"tool":"TerminalOpen","arguments":{}}),
+    )
+    .await;
+    let id = opened["result"]["structuredContent"]["terminal_id"].clone();
+    assert!(id.is_string(), "{opened}");
+    for (name, args) in [
+        ("TerminalRead", json!({"terminal_id":id})),
+        (
+            "TerminalInput",
+            json!({"terminal_id":id,"input":{"kind":"key","key":"enter"}}),
+        ),
+        (
+            "TerminalResize",
+            json!({"terminal_id":id,"rows":30,"cols":100}),
+        ),
+        ("TerminalClose", json!({"terminal_id":id})),
+    ] {
+        let response = tool(&f, &f.b, name, args).await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "not_found"
+        );
+    }
+    let forbidden = tool(
+        &f,
+        &f.read,
+        "Run",
+        json!({"tool":"TerminalOpen","arguments":{}}),
+    )
+    .await;
+    assert_eq!(
+        forbidden["result"]["structuredContent"]["error"]["code"],
+        "permission_denied"
+    );
+    let list = tool(&f, &f.b, "Terminals", json!({})).await;
+    assert!(
+        list["result"]["structuredContent"]["terminals"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let closed = tool(
+        &f,
+        &f.a,
+        "Run",
+        json!({"tool":"TerminalClose","arguments":{"terminal_id":id}}),
+    )
+    .await;
+    assert_eq!(closed["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn recovery_inspection_restore_guards_and_retry_ownership_work_over_http() {
+    let f = fixture(240);
+    let created=tool(&f,&f.a,"Run",json!({"tool":"Write","arguments":{"path":"recover.txt","update":{"mode":"create","content":"original\r\n"}}})).await;
+    let id = created["result"]["structuredContent"]["task_id"].clone();
+    assert!(id.is_string(), "{created}");
+    let hidden = tool(&f, &f.b, "Recover", json!({"source_task_id":id})).await;
+    assert_eq!(
+        hidden["result"]["structuredContent"]["error"]["code"],
+        "not_found"
+    );
+    let inspected = tool(
+        &f,
+        &f.a,
+        "Run",
+        json!({"tool":"Recover","arguments":{"source_task_id":id}}),
+    )
+    .await;
+    let file = &inspected["result"]["structuredContent"]["files"][0];
+    let path = file["path"].as_str().unwrap().to_owned();
+    assert_eq!(file["before"]["state"], "absent");
+    assert_eq!(file["matches_proposed"], true);
+    let mut wrong = serde_json::Map::new();
+    wrong.insert(path.clone(), json!({"state":"absent"}));
+    let stale=tool(&f,&f.a,"Run",json!({"tool":"Recover","arguments":{"source_task_id":id,"recovery":{"action":"restore","versions":wrong}}})).await;
+    assert_eq!(stale["result"]["isError"], true);
+    assert_eq!(
+        stale["result"]["structuredContent"]["error"]["code"],
+        "conflict"
+    );
+    assert!(f.root.path().join("recover.txt").exists());
+    let mut versions = serde_json::Map::new();
+    versions.insert(path, file["current"].clone());
+    let preview=tool(&f,&f.a,"Run",json!({"tool":"Recover","arguments":{"source_task_id":id,"preview":true,"recovery":{"action":"restore","versions":versions}}})).await;
+    assert_eq!(preview["result"]["structuredContent"]["preview"], true);
+    assert!(f.root.path().join("recover.txt").exists());
+    let restored=tool(&f,&f.a,"Run",json!({"tool":"Recover","arguments":{"source_task_id":id,"recovery":{"action":"restore","versions":versions}}})).await;
+    let restore_id = restored["result"]["structuredContent"]["task_id"].clone();
+    assert_eq!(
+        restored["result"]["structuredContent"]["status"],
+        "completed"
+    );
+    assert_ne!(restore_id, id);
+    assert!(!f.root.path().join("recover.txt").exists());
+    let retry=tool(&f,&f.a,"Run",json!({"tool":"Recover","arguments":{"source_task_id":id,"operation_id":restore_id,"recovery":{"action":"restore","versions":versions}}})).await;
+    assert_eq!(
+        retry["result"]["structuredContent"],
+        restored["result"]["structuredContent"]
+    );
 }

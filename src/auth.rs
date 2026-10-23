@@ -65,14 +65,12 @@ pub struct Principal {
 
 impl Principal {
     pub fn allows(&self, tool: &str) -> bool {
-        let scope = match tool {
-            "Read" | "Glob" | "Grep" | "Image" => "read",
-            "Write" | "Edit" | "ApplyPatch" => "write",
-            "Shell" | "Input" => "exec",
-            "Tasks" | "Poll" | "Cancel" => "tasks",
-            "Info" | "Discover" => return true,
-            _ => return false,
+        let Some(scope) = crate::operation::Operation::scope(tool) else {
+            return false;
         };
+        if scope.is_empty() {
+            return true;
+        }
         self.scopes.iter().any(|s| s == scope || s == "*")
     }
     #[cfg(test)]

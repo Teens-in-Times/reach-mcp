@@ -1,16 +1,34 @@
-use anyhow::{Result, bail, ensure};
+use crate::{
+    error::{Failure, Result},
+    operation::ImageArgs,
+    policy::Policy,
+};
 use base64::Engine;
-use serde_json::{Value, json};
-use std::path::Path;
-pub fn load(cwd: &Path, args: &Value) -> Result<Value> {
-    let path = crate::files::resolve(cwd, crate::files::text_arg(args, "path")?);
-    ensure!(
-        std::fs::metadata(&path)?.len() <= 8 * 1024 * 1024,
-        "Image exceeds 8 MiB"
-    );
-    let bytes = std::fs::read(&path)?;
-    ensure!(bytes.len() <= 8 * 1024 * 1024, "Image grew beyond 8 MiB");
-    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+use serde::Serialize;
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
+#[derive(Debug, Serialize)]
+pub struct Image {
+    pub path: PathBuf,
+    pub mime_type: &'static str,
+    pub bytes: usize,
+    pub sha256: String,
+    #[serde(skip)]
+    pub data: String,
+}
+pub fn load(cwd: &Path, args: &ImageArgs, policy: &Policy) -> Result<Image> {
+    let path = crate::files::resolve(cwd, &args.path);
+    policy.check(&path)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(Failure::invalid("Image exceeds 8 MiB"));
+    }
+    let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         "image/png"
     } else if bytes.starts_with(b"\xff\xd8\xff") {
         "image/jpeg"
@@ -19,9 +37,15 @@ pub fn load(cwd: &Path, args: &Value) -> Result<Value> {
     } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         "image/webp"
     } else {
-        bail!("Unsupported image signature; use PNG, JPEG, GIF or WebP")
+        return Err(Failure::invalid(
+            "Unsupported image signature; use PNG, JPEG, GIF or WebP",
+        ));
     };
-    Ok(
-        json!({"path":path,"mime_type":mime,"bytes":bytes.len(),"sha256":crate::files::hash(&bytes),"image_base64":base64::engine::general_purpose::STANDARD.encode(&bytes)}),
-    )
+    Ok(Image {
+        path,
+        mime_type,
+        bytes: bytes.len(),
+        sha256: crate::files::hash(&bytes),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
